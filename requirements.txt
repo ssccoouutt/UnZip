@@ -1,2 +1,2 @@
-pytube
-python-telegram-bot
+pytube>=15.0.0
+   python-telegram-bot>=20.3
