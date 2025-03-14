@@ -1,19 +1,12 @@
 import os
 import logging
 from pytube import YouTube
-from http.cookiejar import MozillaCookieJar
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
 # Set up logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Load cookies from cookies.txt
-def load_cookies():
-    cookie_jar = MozillaCookieJar('cookies.txt')
-    cookie_jar.load()
-    return cookie_jar
 
 async def start(update: Update, context):
     await update.message.reply_text('Send me a YouTube link and I will download the video for you!')
@@ -22,11 +15,8 @@ async def handle_message(update: Update, context):
     url = update.message.text
     if 'youtube.com' in url or 'youtu.be' in url:
         try:
-            # Load cookies
-            cookies = load_cookies()
-            
             # Download the video using pytube
-            yt = YouTube(url, cookies=cookies)
+            yt = YouTube(url)
             stream = yt.streams.get_highest_resolution()
             file_path = stream.download(output_path='downloads')
             
