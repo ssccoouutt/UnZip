@@ -1,69 +1,56 @@
 import os
 import logging
-from pytube import YouTube
-from http.cookiejar import MozillaCookieJar
-import requests
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from pytube import YouTube
 
 # Set up logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load cookies into a session
-def load_session():
-    session = requests.Session()
-    cookie_jar = MozillaCookieJar('cookies.txt')
-    cookie_jar.load()
-    session.cookies = cookie_jar
-    return session
+# Define a command handler for the /start command
+def start(update: Update, context: CallbackContext) -> None:
+    update.message.reply_text('Send me a YouTube video link and I will download it for you!')
 
-async def start(update: Update, context):
-    await update.message.reply_text('Send me a YouTube link and I will download the video for you!')
-
-async def handle_message(update: Update, context):
+# Define a message handler for video links
+def handle_message(update: Update, context: CallbackContext) -> None:
     url = update.message.text
     if 'youtube.com' in url or 'youtu.be' in url:
         try:
-            # Load session with cookies
-            session = load_session()
-            
-            # Download the video using pytube with cookies
-            yt = YouTube(url, use_oauth=False, allow_oauth_cache=False)
-            yt._session = session  # Inject the session with cookies
-            
-            stream = yt.streams.get_highest_resolution()
-            file_path = stream.download(output_path='downloads')
-            
-            # Send the video back to the user
-            await update.message.reply_video(video=open(file_path, 'rb'))
-            
-            # Clean up the downloaded file
-            os.remove(file_path)
+            update.message.reply_text('Downloading video...')
+            yt = YouTube(url)
+            video = yt.streams.get_highest_resolution()
+            video_file = video.download()
+            update.message.reply_text('Uploading video...')
+            with open(video_file, 'rb') as f:
+                context.bot.send_video(chat_id=update.message.chat_id, video=f)
+            os.remove(video_file)  # Clean up the downloaded file
         except Exception as e:
-            logger.error(f"Error downloading video: {e}")
-            await update.message.reply_text('Failed to download the video. Please check the link and try again.')
+            logger.error(f"Error: {e}")
+            update.message.reply_text('An error occurred while downloading the video.')
     else:
-        await update.message.reply_text('Please send a valid YouTube link.')
+        update.message.reply_text('Please send a valid YouTube link.')
 
-def main():
-    # Load Telegram bot token from environment variable
-    TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-    if not TELEGRAM_BOT_TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set.")
+def main() -> None:
+    # Get the bot token from the environment variable
+    token = os.getenv("TELEGRAM_TOKEN")
+    if not token:
+        raise ValueError("No TELEGRAM_TOKEN environment variable set.")
 
-    # Build the application
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    updater = Updater(token)
 
-    # Add handlers
-    start_handler = CommandHandler('start', start)
-    message_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    # Get the dispatcher to register handlers
+    dispatcher = updater.dispatcher
 
-    application.add_handler(start_handler)
-    application.add_handler(message_handler)
+    # Register command and message handlers
+    dispatcher.add_handler(CommandHandler("start", start))
+    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
-    # Start the bot
-    application.run_polling()
+    # Start the Bot
+    updater.start_polling()
+
+    # Run the bot until you send a signal to stop
+    updater.idle()
 
 if __name__ == '__main__':
     main()
