@@ -1,0 +1,3 @@
+pytube
+python-telegram-bot
+browser-cookie3
