@@ -42,15 +42,22 @@ async def handle_message(update: Update, context):
         await update.message.reply_text('Please send a valid YouTube link.')
 
 def main():
-    # Replace 'YOUR_TELEGRAM_BOT_TOKEN' with your actual bot token
-    application = ApplicationBuilder().token('YOUR_TELEGRAM_BOT_TOKEN').build()
+    # Load Telegram bot token from environment variable
+    TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+    if not TELEGRAM_BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set.")
 
+    # Build the application
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Add handlers
     start_handler = CommandHandler('start', start)
     message_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
 
     application.add_handler(start_handler)
     application.add_handler(message_handler)
 
+    # Start the bot
     application.run_polling()
 
 if __name__ == '__main__':
