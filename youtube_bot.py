@@ -1,7 +1,7 @@
 import os
 import logging
 from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, filters, CallbackContext
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from pytube import YouTube
 
 # Set up logging
@@ -9,48 +9,44 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 # Define a command handler for the /start command
-def start(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text('Send me a YouTube video link and I will download it for you!')
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text('Send me a YouTube video link and I will download it for you!')
 
 # Define a message handler for video links
-def handle_message(update: Update, context: CallbackContext) -> None:
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     url = update.message.text
     if 'youtube.com' in url or 'youtu.be' in url:
         try:
-            update.message.reply_text('Downloading video...')
+            await update.message.reply_text('Downloading video...')
             yt = YouTube(url)
             video = yt.streams.get_highest_resolution()
             video_file = video.download()
-            update.message.reply_text('Uploading video...')
+            await update.message.reply_text('Uploading video...')
             with open(video_file, 'rb') as f:
-                context.bot.send_video(chat_id=update.message.chat_id, video=f)
+                await context.bot.send_video(chat_id=update.message.chat_id, video=f)
             os.remove(video_file)  # Clean up the downloaded file
         except Exception as e:
             logger.error(f"Error: {e}")
-            update.message.reply_text('An error occurred while downloading the video.')
+            await update.message.reply_text('An error occurred while downloading the video.')
     else:
-        update.message.reply_text('Please send a valid YouTube link.')
+        await update.message.reply_text('Please send a valid YouTube link.')
 
-def main() -> None:
+async def main() -> None:
     # Get the bot token from the environment variable
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
         raise ValueError("No TELEGRAM_TOKEN environment variable set.")
 
-    updater = Updater(token)
-
-    # Get the dispatcher to register handlers
-    dispatcher = updater.dispatcher
+    # Create the Application
+    application = ApplicationBuilder().token(token).build()
 
     # Register command and message handlers
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Start the Bot
-    updater.start_polling()
-
-    # Run the bot until you send a signal to stop
-    updater.idle()
+    await application.run_polling()
 
 if __name__ == '__main__':
-    main()
+    import asyncio
+    asyncio.run(main())
