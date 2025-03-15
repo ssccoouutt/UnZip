@@ -5,6 +5,7 @@ import tempfile
 import base64
 import zipfile
 import shutil
+import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from google.oauth2.credentials import Credentials
@@ -65,8 +66,21 @@ async def upload_to_google_drive(file_path, file_name):
     file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
     return file.get('id')
 
+async def download_file_from_link(url, destination):
+    """Download a file from a direct download link."""
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        with open(destination, 'wb') as file:
+            for chunk in response.iter_content(chunk_size=8192):
+                file.write(chunk)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to download file from {url}: {e}")
+        return False
+
 async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Unzip a file and upload its contents to Google Drive."""
+    """Unzip a file from a direct download link and upload its contents to Google Drive."""
     try:
         # Check if Google Drive is authorized
         creds = authorize_google_drive()
@@ -76,14 +90,21 @@ async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # Get the file from the Telegram message
-        file = await context.bot.get_file(update.message.document.file_id)
-        file_path = os.path.join(tempfile.gettempdir(), update.message.document.file_name)
-        await file.download_to_drive(file_path)
+        # Get the download link from the message
+        url = update.message.text.strip()
+
+        # Download the file
+        file_name = os.path.basename(url) or "downloaded_file.zip"
+        file_path = os.path.join(tempfile.gettempdir(), file_name)
+        await update.message.reply_text("⬇️ Downloading file...")
+
+        if not await download_file_from_link(url, file_path):
+            await update.message.reply_text("❌ Failed to download the file. Please check the link.")
+            return
 
         # Check if the file is a zip file
         if not file_path.endswith('.zip'):
-            await update.message.reply_text("❌ Please send a .zip file.")
+            await update.message.reply_text("❌ Please provide a link to a .zip file.")
             os.remove(file_path)
             return
 
@@ -92,6 +113,7 @@ async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.makedirs(extract_dir, exist_ok=True)
 
         # Unzip the file
+        await update.message.reply_text("📦 Extracting files...")
         with zipfile.ZipFile(file_path, 'r') as zip_ref:
             zip_ref.extractall(extract_dir)
 
@@ -100,6 +122,7 @@ async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for root, _, files in os.walk(extract_dir):
             for file_name in files:
                 file_path = os.path.join(root, file_name)
+                await update.message.reply_text(f"⬆️ Uploading {file_name} to Google Drive...")
                 drive_file_id = await upload_to_google_drive(file_path, file_name)
                 uploaded_files.append((file_name, drive_file_id))
 
@@ -120,9 +143,9 @@ async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {str(e)}")
         logger.error(f"Unzip and upload error: {e}")
         # Clean up temporary files in case of error
-        if os.path.exists(file_path):
+        if 'file_path' in locals() and os.path.exists(file_path):
             os.remove(file_path)
-        if os.path.exists(extract_dir):
+        if 'extract_dir' in locals() and os.path.exists(extract_dir):
             shutil.rmtree(extract_dir, ignore_errors=True)
 
 async def start_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -159,7 +182,7 @@ async def handle_authorization_code(update: Update, context: ContextTypes.DEFAUL
         flow.fetch_token(code=code)
         with open(TOKEN_FILE, 'w') as token_file:
             token_file.write(flow.credentials.to_json())
-        await update.message.reply_text("✅ Authorization successful! You can now send files.")
+        await update.message.reply_text("✅ Authorization successful! You can now send links.")
     except Exception as e:
         await update.message.reply_text(f"❌ Authorization failed. Please try again. Error: {str(e)}")
         logger.error(f"Authorization error: {e}")
@@ -171,20 +194,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if the message is an authorization code
     if re.match(r'^[A-Za-z0-9_\-]+/[A-Za-z0-9_\-]+$', message_text):
         await handle_authorization_code(update, context)
+    # Check if the message is a direct download link
+    elif message_text.startswith(("http://", "https://")):
+        await unzip_and_upload(update, context)
     else:
-        await update.message.reply_text("⚠️ Please send a .zip file or an authorization code.")
+        await update.message.reply_text("⚠️ Please send a direct download link or an authorization code.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
     await update.message.reply_text(
-        "Send me a .zip file, and I'll unzip it and upload its contents to your Google Drive!"
+        "Send me a direct download link to a .zip file, and I'll unzip it and upload its contents to your Google Drive!"
     )
 
 def main():
     """Start the bot."""
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Document.ALL, unzip_and_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
 
