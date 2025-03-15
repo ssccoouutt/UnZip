@@ -23,7 +23,6 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')  # From environment variabl
 GOOGLE_CREDENTIALS = os.getenv('GOOGLE_CREDENTIALS')  # Base64 encoded credentials
 CLIENT_SECRET_FILE = 'credentials.json'  # Created from environment variable
 TOKEN_FILE = 'token.json'  # Stored in ephemeral storage
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB (adjust as needed)
 
 # Initialize logging
 logging.basicConfig(
@@ -81,13 +80,6 @@ async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await context.bot.get_file(update.message.document.file_id)
         file_path = os.path.join(tempfile.gettempdir(), update.message.document.file_name)
         await file.download_to_drive(file_path)
-
-        # Check file size
-        file_size = os.path.getsize(file_path)
-        if file_size > MAX_FILE_SIZE:
-            await update.message.reply_text(f"❌ File is too big. Maximum allowed size is {MAX_FILE_SIZE / (1024 * 1024)} MB.")
-            os.remove(file_path)
-            return
 
         # Check if the file is a zip file
         if not file_path.endswith('.zip'):
