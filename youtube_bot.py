@@ -67,20 +67,39 @@ async def upload_to_google_drive(file_path, file_name):
     return file.get('id')
 
 async def download_file_from_link(url, destination):
-    """Download a file from a direct download link."""
+    """Download a file from a direct download link or Google Drive link."""
     try:
-        response = requests.get(url, stream=True)
+        # Check if the link is a Google Drive link
+        if "drive.google.com" in url:
+            file_id = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+            if not file_id:
+                return False, "❌ Invalid Google Drive link."
+            file_id = file_id.group(1)
+            download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+            creds = authorize_google_drive()
+            headers = {"Authorization": f"Bearer {creds.token}"}
+            response = requests.get(download_url, headers=headers, stream=True)
+        else:
+            # Direct download link
+            response = requests.get(url, stream=True)
+
         response.raise_for_status()
+
+        # Check if the file is a zip file
+        content_type = response.headers.get('Content-Type', '').lower()
+        if 'zip' not in content_type and not url.lower().endswith('.zip'):
+            return False, "❌ The provided link does not point to a .zip file."
+
         with open(destination, 'wb') as file:
             for chunk in response.iter_content(chunk_size=8192):
                 file.write(chunk)
-        return True
+        return True, None
     except Exception as e:
         logger.error(f"Failed to download file from {url}: {e}")
-        return False
+        return False, f"❌ Failed to download the file: {e}"
 
 async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Unzip a file from a direct download link and upload its contents to Google Drive."""
+    """Unzip a file from a direct download link or Google Drive link and upload its contents to Google Drive."""
     try:
         # Check if Google Drive is authorized
         creds = authorize_google_drive()
@@ -98,14 +117,9 @@ async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_path = os.path.join(tempfile.gettempdir(), file_name)
         await update.message.reply_text("⬇️ Downloading file...")
 
-        if not await download_file_from_link(url, file_path):
-            await update.message.reply_text("❌ Failed to download the file. Please check the link.")
-            return
-
-        # Check if the file is a zip file
-        if not file_path.endswith('.zip'):
-            await update.message.reply_text("❌ Please provide a link to a .zip file.")
-            os.remove(file_path)
+        success, error_message = await download_file_from_link(url, file_path)
+        if not success:
+            await update.message.reply_text(error_message)
             return
 
         # Create a temporary directory to extract files
@@ -194,7 +208,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if the message is an authorization code
     if re.match(r'^[A-Za-z0-9_\-]+/[A-Za-z0-9_\-]+$', message_text):
         await handle_authorization_code(update, context)
-    # Check if the message is a direct download link
+    # Check if the message is a direct download link or Google Drive link
     elif message_text.startswith(("http://", "https://")):
         await unzip_and_upload(update, context)
     else:
@@ -203,7 +217,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
     await update.message.reply_text(
-        "Send me a direct download link to a .zip file, and I'll unzip it and upload its contents to your Google Drive!"
+        "Send me a direct download link or Google Drive link to a .zip file, and I'll unzip it and upload its contents to your Google Drive!"
     )
 
 def main():
