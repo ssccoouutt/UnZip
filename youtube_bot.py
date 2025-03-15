@@ -4,6 +4,7 @@ import re
 import tempfile
 import base64
 import zipfile
+import shutil
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from google.oauth2.credentials import Credentials
@@ -22,6 +23,7 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')  # From environment variabl
 GOOGLE_CREDENTIALS = os.getenv('GOOGLE_CREDENTIALS')  # Base64 encoded credentials
 CLIENT_SECRET_FILE = 'credentials.json'  # Created from environment variable
 TOKEN_FILE = 'token.json'  # Stored in ephemeral storage
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB (adjust as needed)
 
 # Initialize logging
 logging.basicConfig(
@@ -35,9 +37,13 @@ if GOOGLE_CREDENTIALS and not os.path.exists(CLIENT_SECRET_FILE):
     try:
         with open(CLIENT_SECRET_FILE, 'w') as f:
             f.write(base64.b64decode(GOOGLE_CREDENTIALS).decode())
+        logger.info("Created credentials.json from environment variable.")
     except Exception as e:
         logger.error(f"Failed to create credentials.json: {e}")
         raise
+elif not os.path.exists(CLIENT_SECRET_FILE):
+    logger.error("GOOGLE_CREDENTIALS environment variable is missing or empty.")
+    raise FileNotFoundError("credentials.json not found and GOOGLE_CREDENTIALS not provided.")
 
 def authorize_google_drive():
     """Authorize Google Drive API using OAuth2."""
@@ -76,6 +82,13 @@ async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_path = os.path.join(tempfile.gettempdir(), update.message.document.file_name)
         await file.download_to_drive(file_path)
 
+        # Check file size
+        file_size = os.path.getsize(file_path)
+        if file_size > MAX_FILE_SIZE:
+            await update.message.reply_text(f"❌ File is too big. Maximum allowed size is {MAX_FILE_SIZE / (1024 * 1024)} MB.")
+            os.remove(file_path)
+            return
+
         # Check if the file is a zip file
         if not file_path.endswith('.zip'):
             await update.message.reply_text("❌ Please send a .zip file.")
@@ -109,29 +122,38 @@ async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Clean up temporary files
         os.remove(file_path)
-        for root, _, files in os.walk(extract_dir):
-            for file_name in files:
-                os.remove(os.path.join(root, file_name))
-        os.rmdir(extract_dir)
+        shutil.rmtree(extract_dir, ignore_errors=True)  # Remove directory and all contents
 
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
         logger.error(f"Unzip and upload error: {e}")
+        # Clean up temporary files in case of error
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        if os.path.exists(extract_dir):
+            shutil.rmtree(extract_dir, ignore_errors=True)
 
 async def start_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the OAuth2 authorization flow."""
-    flow = Flow.from_client_secrets_file(
-        CLIENT_SECRET_FILE,
-        scopes=SCOPES,
-        redirect_uri='urn:ietf:wg:oauth:2.0:oob'
-    )
-    auth_url, _ = flow.authorization_url(prompt='consent')
-    context.user_data['flow'] = flow  # Store the flow object in user_data
-    await update.message.reply_text(
-        f"🔑 Authorization required!\n\n"
-        f"Please visit this link to authorize:\n{auth_url}\n\n"
-        "After authorization, send the code you receive back here."
-    )
+    try:
+        flow = Flow.from_client_secrets_file(
+            CLIENT_SECRET_FILE,
+            scopes=SCOPES,
+            redirect_uri='urn:ietf:wg:oauth:2.0:oob'
+        )
+        auth_url, _ = flow.authorization_url(prompt='consent')
+        context.user_data['flow'] = flow  # Store the flow object in user_data
+        await update.message.reply_text(
+            f"🔑 Authorization required!\n\n"
+            f"Please visit this link to authorize:\n{auth_url}\n\n"
+            "After authorization, send the code you receive back here."
+        )
+    except FileNotFoundError:
+        await update.message.reply_text("❌ credentials.json file is missing. Please provide the file.")
+        logger.error("credentials.json file is missing.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to start authorization. Error: {str(e)}")
+        logger.error(f"Authorization error: {e}")
 
 async def handle_authorization_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the authorization code from the user."""
