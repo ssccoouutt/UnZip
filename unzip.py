@@ -29,7 +29,7 @@ from aiohttp import web
 
 # Configuration
 SCOPES = ['https://www.googleapis.com/auth/drive']
-TELEGRAM_BOT_TOKEN = '7829579947:AAFxoAbbfTako-XC1fmzPJQJSaQsS852V2g'
+TELEGRAM_BOT_TOKEN = '7539483784:AAE4MlT-IGXEb7md3v6pyhbkxe9VtCXZSe0'
 CLIENT_SECRET_FILE = 'credentials.json'
 TOKEN_FILE = 'token.json'
 WEB_PORT = 8000
