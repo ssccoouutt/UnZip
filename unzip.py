@@ -29,16 +29,16 @@ from aiohttp import web
 
 # Configuration
 SCOPES = ['https://www.googleapis.com/auth/drive']
-TELEGRAM_BOT_TOKEN = '7539483784:AAE4MlT-IGXEb7md3v6pyhbkxe9VtCXZSe0'
+TELEGRAM_BOT_TOKEN = '7829579947:AAFxoAbbfTako-XC1fmzPJQJSaQsS852V2g'
 CLIENT_SECRET_FILE = 'credentials.json'
 TOKEN_FILE = 'token.json'
 WEB_PORT = 8000
 PING_INTERVAL = 25
 HEALTH_CHECK_ENDPOINT = "/health"
-REDIRECT_URI = 'http://localhost:8080'  # Localhost redirect URI
+REDIRECT_URI = 'http://localhost:8080'
 
 # Conversation states
-WAITING_FOR_REDIRECT_URL = 1
+AUTH_URL, PROCESS_LINK = range(2)
 
 # Initialize logging
 logging.basicConfig(
@@ -47,19 +47,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global variables for web server
+# Global variables
 runner = None
 site = None
+app = None
 
-# Web Server Functions
 async def health_check(request):
     return web.Response(text=f"Bot operational | Last active: {datetime.now()}", status=200)
 
 async def run_webserver():
     global runner, site
-    app = web.Application()
-    app.router.add_get(HEALTH_CHECK_ENDPOINT, health_check)
-    runner = web.AppRunner(app)
+    web_app = web.Application()
+    web_app.router.add_get(HEALTH_CHECK_ENDPOINT, health_check)
+    runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', WEB_PORT)
     await site.start()
@@ -75,7 +75,6 @@ async def self_ping():
             logger.error(f"Keepalive error: {str(e)}")
         await asyncio.sleep(PING_INTERVAL)
 
-# Google Drive Functions
 def authorize_google_drive():
     creds = None
     if os.path.exists(TOKEN_FILE):
@@ -107,83 +106,6 @@ async def upload_to_google_drive(file_path, file_name, parent_folder_id=None):
     file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
     return file.get('id')
 
-# Authorization Flow
-async def start_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        flow = Flow.from_client_secrets_file(
-            CLIENT_SECRET_FILE,
-            scopes=SCOPES,
-            redirect_uri=REDIRECT_URI
-        )
-        auth_url, _ = flow.authorization_url(prompt='consent')
-        context.user_data['flow'] = flow
-        
-        keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data='cancel_auth')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "🔑 *Authorization Required*\n\n"
-            "1. Click this link to authorize:\n"
-            f"[Authorize Google Drive]({auth_url})\n\n"
-            "2. After approving, copy the ENTIRE URL from your browser\n"
-            "3. Send that URL back to me\n\n"
-            "⚠️ You may see an 'unverified app' warning. Click 'Advanced' then 'Continue'.",
-            parse_mode='Markdown',
-            disable_web_page_preview=True,
-            reply_markup=reply_markup
-        )
-        return WAITING_FOR_REDIRECT_URL
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ Authorization error: {str(e)}")
-        logger.error(f"Authorization error: {e}")
-        return ConversationHandler.END
-
-async def handle_redirect_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    flow = context.user_data.get('flow')
-    
-    if not flow:
-        await update.message.reply_text("❌ No active authorization session.")
-        return ConversationHandler.END
-
-    try:
-        parsed = urlparse(url)
-        if not (parsed.netloc == 'localhost:8080' and parsed.scheme == 'http'):
-            await update.message.reply_text("❌ Invalid URL. Please send the exact redirect URL.")
-            return WAITING_FOR_REDIRECT_URL
-            
-        query = parse_qs(parsed.query)
-        code = query.get('code', [None])[0]
-        
-        if not code:
-            await update.message.reply_text("❌ No authorization code found in URL.")
-            return WAITING_FOR_REDIRECT_URL
-
-        flow.fetch_token(code=code)
-        with open(TOKEN_FILE, 'w') as token_file:
-            token_file.write(flow.credentials.to_json())
-        
-        del context.user_data['flow']
-        await update.message.reply_text("✅ *Authorization Successful!*", parse_mode='Markdown')
-        return ConversationHandler.END
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ Authorization failed: {str(e)}")
-        logger.error(f"Token exchange error: {e}")
-        return ConversationHandler.END
-
-async def cancel_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    if 'flow' in context.user_data:
-        del context.user_data['flow']
-    
-    await query.edit_message_text("❌ Authorization cancelled.")
-    return ConversationHandler.END
-
-# Archive Handling
 async def download_file_from_link(url, destination):
     try:
         if "drive.google.com" in url:
@@ -218,12 +140,84 @@ async def extract_archive(archive_path, extract_dir):
         logger.error(f"Extraction error: {e}")
         return False, f"❌ Extraction failed: {e}"
 
-async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        creds = authorize_google_drive()
-    except Exception as e:
-        return await start_authorization(update, context)
+        flow = Flow.from_client_secrets_file(
+            CLIENT_SECRET_FILE,
+            scopes=SCOPES,
+            redirect_uri=REDIRECT_URI
+        )
+        auth_url, _ = flow.authorization_url(prompt='consent')
+        context.user_data['flow'] = flow
+        
+        keyboard = [
+            [InlineKeyboardButton("❌ Cancel", callback_data='cancel_auth')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "🔑 *Authorization Required*\n\n"
+            "1. Click this link to authorize:\n"
+            f"[Authorize Google Drive]({auth_url})\n\n"
+            "2. After approving, you'll get a localhost URL\n"
+            "3. Copy and send that URL back to me\n\n"
+            "⚠️ Ignore browser errors, just copy the URL",
+            parse_mode='Markdown',
+            disable_web_page_preview=True,
+            reply_markup=reply_markup
+        )
+        return AUTH_URL
 
+    except Exception as e:
+        await update.message.reply_text(f"❌ Authorization error: {str(e)}")
+        logger.error(f"Authorization error: {e}")
+        return ConversationHandler.END
+
+async def handle_auth_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    flow = context.user_data.get('flow')
+    
+    if not flow:
+        await update.message.reply_text("❌ No active authorization session.")
+        return ConversationHandler.END
+
+    try:
+        parsed = urlparse(url)
+        if not (parsed.netloc == 'localhost:8080' and parsed.scheme == 'http'):
+            await update.message.reply_text("❌ Invalid URL. Send the exact redirect URL.")
+            return AUTH_URL
+            
+        query = parse_qs(parsed.query)
+        code = query.get('code', [None])[0]
+        
+        if not code:
+            await update.message.reply_text("❌ No authorization code found.")
+            return AUTH_URL
+
+        flow.fetch_token(code=code)
+        with open(TOKEN_FILE, 'w') as token_file:
+            token_file.write(flow.credentials.to_json())
+        
+        del context.user_data['flow']
+        await update.message.reply_text("✅ *Authorization Successful!*", parse_mode='Markdown')
+        return ConversationHandler.END
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Authorization failed: {str(e)}")
+        logger.error(f"Token exchange error: {e}")
+        return AUTH_URL
+
+async def cancel_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if 'flow' in context.user_data:
+        del context.user_data['flow']
+    
+    await query.edit_message_text("❌ Authorization cancelled.")
+    return ConversationHandler.END
+
+async def process_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         url = update.message.text.strip()
         file_name = os.path.basename(url.split('?')[0]) or "archive"
@@ -260,53 +254,120 @@ async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {str(e)}")
         logger.error(f"Processing error: {e}")
     finally:
-        if 'file_path' in locals(): shutil.rmtree(extract_dir, ignore_errors=True)
-        if 'extract_dir' in locals(): os.remove(file_path)
+        if 'file_path' in locals() and os.path.exists(file_path):
+            os.remove(file_path)
+        if 'extract_dir' in locals() and os.path.exists(extract_dir):
+            shutil.rmtree(extract_dir, ignore_errors=True)
+    return ConversationHandler.END
 
-# Telegram Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🔑 Authorize Google Drive", callback_data='start_auth')],
+        [InlineKeyboardButton("🛠 Help", callback_data='help')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await update.message.reply_text(
-        "Send me a Google Drive or direct download link to a ZIP file, "
-        "and I'll upload its contents to your Google Drive!"
+        "Welcome to Google Drive Uploader Bot!\n\n"
+        "1. First authorize Google Drive access\n"
+        "2. Then send me file links to process",
+        reply_markup=reply_markup
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    
+    # Check if message is authorization redirect URL
+    if text.startswith("http://localhost:8080") and 'code=' in text:
+        if 'flow' in context.user_data:
+            return await handle_auth_url(update, context)
+        else:
+            await update.message.reply_text("⚠️ Start authorization first using /auth")
+            return
+    
+    # Process as regular link
     if text.startswith(("http://", "https://")):
-        await unzip_and_upload(update, context)
+        await process_link(update, context)
     else:
-        await update.message.reply_text("Please send a valid download link")
+        await update.message.reply_text(
+            "Please send either:\n"
+            "- Google Drive/direct download link\n"
+            "- Or authorization URL if you're in the middle of setup"
+        )
 
-# Main Application
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📚 Help Guide:\n\n"
+        "1. Click 'Authorize Google Drive' or use /auth\n"
+        "2. Complete the Google authorization process\n"
+        "3. Copy the localhost URL from your browser\n"
+        "4. Send that URL back to the bot\n"
+        "5. Now you can send download links for processing\n\n"
+        "Cancel anytime with /cancel"
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'start_auth':
+        await start_authorization(update, context)
+    elif query.data == 'help':
+        await help_command(update, context)
+    elif query.data == 'cancel_auth':
+        await cancel_auth(update, context)
+
+async def shutdown(signal, loop):
+    logger.info(f"Received exit signal {signal.name}...")
+    
+    global app
+    if app:
+        await app.stop()
+        await app.shutdown()
+    
+    global runner, site
+    if site:
+        await site.stop()
+    if runner:
+        await runner.cleanup()
+    
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    for task in tasks:
+        task.cancel()
+    
+    logger.info(f"Cancelling {len(tasks)} outstanding tasks")
+    await asyncio.gather(*tasks, return_exceptions=True)
+    loop.stop()
+
 async def run_bot():
+    global app
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
-    # Conversation handler for auth flow
-    auth_conv = ConversationHandler(
-        entry_points=[CommandHandler("auth", start_authorization)],
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('start', start),
+            CommandHandler('auth', start_authorization),
+            CallbackQueryHandler(button_handler)
+        ],
         states={
-            WAITING_FOR_REDIRECT_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_redirect_url)]
+            AUTH_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_auth_url)],
+            PROCESS_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_link)]
         },
-        fallbacks=[CallbackQueryHandler(cancel_auth, pattern='^cancel_auth$')],
+        fallbacks=[
+            CommandHandler('cancel', cancel_auth),
+            CallbackQueryHandler(cancel_auth, pattern='^cancel_auth$')
+        ],
         per_message=False
     )
     
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(auth_conv)
+    app.add_handler(conv_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
+    
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-
-    while True:
-        await asyncio.sleep(3600)
-
-async def shutdown(signal, loop):
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    [task.cancel() for task in tasks]
-    await asyncio.gather(*tasks, return_exceptions=True)
-    loop.stop()
+    
+    logger.info("Bot started in polling mode")
 
 async def main():
     webserver_task = asyncio.create_task(run_webserver())
@@ -317,9 +378,9 @@ async def main():
         await asyncio.gather(webserver_task, ping_task, bot_task)
     except asyncio.CancelledError:
         logger.info("Shutting down gracefully...")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
     finally:
-        if site: await site.stop()
-        if runner: await runner.cleanup()
         logger.info("Cleanup completed")
 
 if __name__ == '__main__':
