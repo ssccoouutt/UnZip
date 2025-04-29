@@ -7,6 +7,7 @@ import shutil
 import requests
 import asyncio
 import aiohttp
+import signal  # Added this import
 from datetime import datetime
 from telegram import Update
 from telegram.ext import (
@@ -126,7 +127,6 @@ async def upload_to_google_drive(file_path, file_name, parent_folder_id=None):
 async def download_file_from_link(url, destination):
     """Download a file from a direct download link or Google Drive link."""
     try:
-        # Check if the link is a Google Drive link
         if "drive.google.com" in url:
             file_id = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
             if not file_id:
@@ -137,12 +137,10 @@ async def download_file_from_link(url, destination):
             headers = {"Authorization": f"Bearer {creds.token}"}
             response = requests.get(download_url, headers=headers, stream=True)
         else:
-            # Direct download link
             response = requests.get(url, stream=True)
 
         response.raise_for_status()
 
-        # Check if the file is a supported archive
         content_type = response.headers.get('Content-Type', '').lower()
         supported_types = ['zip', 'rar', 'x-7z-compressed', 'octet-stream']
         if not any(arch_type in content_type for arch_type in supported_types) and not any(url.lower().endswith(ext) for ext in ['.zip', '.rar', '.7z']):
@@ -164,28 +162,21 @@ async def extract_archive(archive_path, extract_dir):
                 zip_ref.extractall(extract_dir)
             return True, None
         else:
-            # For RAR and 7z, we'd need additional libraries like patool or pyunpack
-            # This is a placeholder for future implementation
             return False, "❌ RAR and 7z extraction support coming soon. Currently only ZIP files are supported."
     except Exception as e:
         logger.error(f"Failed to extract archive: {e}")
         return False, f"❌ Failed to extract archive: {e}"
 
 async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Unzip a file from a direct download link or Google Drive link and upload its contents to Google Drive."""
+    """Process archive and upload to Google Drive."""
     try:
-        # Check if Google Drive is authorized
         creds = authorize_google_drive()
     except Exception as e:
-        # If not authorized, start the OAuth2 flow
         await start_authorization(update, context)
         return
 
     try:
-        # Get the download link from the message
         url = update.message.text.strip()
-
-        # Download the file
         file_name = os.path.basename(url.split('?')[0]) or "downloaded_archive"
         file_path = os.path.join(tempfile.gettempdir(), file_name)
         await update.message.reply_text("⬇️ Downloading file...")
@@ -195,23 +186,19 @@ async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(error_message)
             return
 
-        # Create a folder in Google Drive with the archive name (without extension)
         folder_name = os.path.splitext(file_name)[0]
         await update.message.reply_text(f"📁 Creating folder '{folder_name}' in Google Drive...")
         folder_id = await create_drive_folder(folder_name)
 
-        # Create a temporary directory to extract files
         extract_dir = os.path.join(tempfile.gettempdir(), 'extracted_files')
         os.makedirs(extract_dir, exist_ok=True)
 
-        # Extract the archive
         await update.message.reply_text("📦 Extracting files...")
         success, error_message = await extract_archive(file_path, extract_dir)
         if not success:
             await update.message.reply_text(error_message)
             return
 
-        # Upload each extracted file to Google Drive folder
         uploaded_files = []
         for root, _, files in os.walk(extract_dir):
             for file_name in files:
@@ -221,10 +208,9 @@ async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 drive_file_id = await upload_to_google_drive(file_path, file_name, folder_id)
                 uploaded_files.append((relative_path, drive_file_id))
 
-        # Send a confirmation message
         if uploaded_files:
             message = f"✅ Uploaded {len(uploaded_files)} files to Google Drive folder '{folder_name}':\n"
-            for file_name, drive_file_id in uploaded_files[:10]:  # Show first 10 files to avoid message too long
+            for file_name, drive_file_id in uploaded_files[:10]:
                 message += f"- {file_name}\n"
             if len(uploaded_files) > 10:
                 message += f"... and {len(uploaded_files) - 10} more files\n"
@@ -233,14 +219,12 @@ async def unzip_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ No files found in the archive.")
 
-        # Clean up temporary files
         os.remove(file_path)
         shutil.rmtree(extract_dir, ignore_errors=True)
 
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
         logger.error(f"Unzip and upload error: {e}")
-        # Clean up temporary files in case of error
         if 'file_path' in locals() and os.path.exists(file_path):
             os.remove(file_path)
         if 'extract_dir' in locals() and os.path.exists(extract_dir):
@@ -255,7 +239,7 @@ async def start_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE
             redirect_uri='urn:ietf:wg:oauth:2.0:oob'
         )
         auth_url, _ = flow.authorization_url(prompt='consent')
-        context.user_data['flow'] = flow  # Store the flow object in user_data
+        context.user_data['flow'] = flow
         await update.message.reply_text(
             f"🔑 Authorization required!\n\n"
             f"Please visit this link to authorize:\n{auth_url}\n\n"
@@ -289,10 +273,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all incoming messages."""
     message_text = update.message.text.strip()
 
-    # Check if the message is an authorization code
     if re.match(r'^[A-Za-z0-9_\-]+/[A-Za-z0-9_\-]+$', message_text):
         await handle_authorization_code(update, context)
-    # Check if the message is a direct download link or Google Drive link
     elif message_text.startswith(("http://", "https://")):
         await unzip_and_upload(update, context)
     else:
@@ -311,12 +293,10 @@ async def run_bot():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Start the bot
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
 
-    # Run until shutdown
     while True:
         await asyncio.sleep(3600)
 
