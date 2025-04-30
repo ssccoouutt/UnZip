@@ -56,8 +56,11 @@ class BotApplication:
         self.webserver_task = None
         self.bot_task = None
         self.loop = None
+        self.shutting_down = False
 
     async def health_check(self, request):
+        if self.shutting_down:
+            return web.Response(text="Shutting down", status=503)
         return web.Response(text=f"Bot operational | Last active: {datetime.now()}", status=200)
 
     async def run_webserver(self):
@@ -70,7 +73,7 @@ class BotApplication:
         logger.info(f"Health check server running on port {WEB_PORT}")
 
     async def self_ping(self):
-        while True:
+        while not self.shutting_down:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(f'http://localhost:{WEB_PORT}{HEALTH_CHECK_ENDPOINT}') as resp:
@@ -299,27 +302,6 @@ class BotApplication:
             reply_markup=reply_markup
         )
 
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
-        
-        # Check if message is authorization redirect URL
-        if text.startswith("http://localhost:8080") and 'code=' in text:
-            if 'flow' in context.user_data:
-                return await self.handle_auth_url(update, context)
-            else:
-                await update.message.reply_text("⚠️ Start authorization first using /auth")
-                return
-        
-        # Process as regular link
-        if text.startswith(("http://", "https://")):
-            await self.process_link(update, context)
-        else:
-            await update.message.reply_text(
-                "Please send either:\n"
-                "- Google Drive/direct download link\n"
-                "- Or authorization URL if you're in the middle of setup"
-            )
-
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "📚 Help Guide:\n\n"
@@ -343,9 +325,11 @@ class BotApplication:
             await self.cancel_auth(update, context)
 
     async def shutdown(self, signal=None):
-        logger.info(f"Received exit signal {signal.name if signal else 'manual'}...")
+        if self.shutting_down:
+            return
+        self.shutting_down = True
         
-        tasks = []
+        logger.info(f"Received exit signal {signal.name if signal else 'manual'}...")
         
         # Shutdown bot application
         if self.app:
@@ -371,15 +355,16 @@ class BotApplication:
                 logger.error(f"Error cleaning up runner: {e}")
 
         # Cancel tasks
-        if self.keepalive_task:
+        tasks = []
+        if self.keepalive_task and not self.keepalive_task.done():
             self.keepalive_task.cancel()
             tasks.append(self.keepalive_task)
         
-        if self.webserver_task:
+        if self.webserver_task and not self.webserver_task.done():
             self.webserver_task.cancel()
             tasks.append(self.webserver_task)
         
-        if self.bot_task:
+        if self.bot_task and not self.bot_task.done():
             self.bot_task.cancel()
             tasks.append(self.bot_task)
 
@@ -392,6 +377,7 @@ class BotApplication:
     async def run_bot(self):
         self.app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         
+        # Separate handlers for better control
         conv_handler = ConversationHandler(
             entry_points=[
                 CommandHandler('start', self.start),
@@ -406,7 +392,7 @@ class BotApplication:
                 CommandHandler('cancel', self.cancel_auth),
                 CallbackQueryHandler(self.cancel_auth, pattern='^cancel_auth$')
             ],
-            per_message=True  # Changed to True to properly track callback queries
+            per_message=False  # Changed back to False to avoid warnings
         )
         
         self.app.add_handler(conv_handler)
@@ -414,8 +400,6 @@ class BotApplication:
         
         await self.app.initialize()
         await self.app.start()
-        if not self.app.updater:
-            self.app.updater = self.app.bot
         await self.app.updater.start_polling(drop_pending_updates=True)
         
         logger.info("Bot started in polling mode")
@@ -429,7 +413,8 @@ class BotApplication:
             await asyncio.gather(
                 self.webserver_task,
                 self.keepalive_task,
-                self.bot_task
+                self.bot_task,
+                return_exceptions=True
             )
         except asyncio.CancelledError:
             logger.info("Shutting down gracefully...")
