@@ -36,7 +36,7 @@ WEB_PORT = int(os.getenv('WEB_PORT', '8000'))
 PING_INTERVAL = int(os.getenv('PING_INTERVAL', '25'))
 HEALTH_CHECK_ENDPOINT = "/health"
 REDIRECT_URI = os.getenv('REDIRECT_URI', 'http://localhost:8080')
-MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', '524288000'))  # 500MB
+MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', '2500288000'))  # 500MB
 
 # Conversation states
 AUTH_URL, PROCESS_LINK = range(2)
