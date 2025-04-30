@@ -311,19 +311,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     if query.data == 'start_auth':
-        await start_authorization(update, context)
+        await start_authorization(query, context)
     elif query.data == 'help':
-        await help_command(update, context)
+        await help_command(query, context)
     elif query.data == 'cancel_auth':
-        await cancel_auth(update, context)
+        await cancel_auth(query, context)
 
 async def shutdown(signal, loop):
     logger.info(f"Received exit signal {signal.name}...")
     
     global app
     if app:
-        await app.stop()
-        await app.shutdown()
+        try:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
     
     global runner, site
     if site:
@@ -362,6 +366,7 @@ async def run_bot():
     
     app.add_handler(conv_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_handler))
     
     await app.initialize()
     await app.start()
