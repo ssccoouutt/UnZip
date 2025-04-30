@@ -11,16 +11,16 @@ import aiohttp
 import signal
 from datetime import datetime
 from urllib.parse import urlparse
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    filters,
-    CallbackQueryHandler
+    filters
 )
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request  # Added missing import
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from aiohttp import web
@@ -28,7 +28,7 @@ from aiohttp import web
 # Configuration
 SCOPES = ['https://www.googleapis.com/auth/drive']
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7539483784:AAE4MlT-IGXEb7md3v6pyhbkxe9VtCXZSe0')
-TOKEN_FILE = 'token.json'  # Loaded from root directory
+TOKEN_FILE = 'token.json'
 WEB_PORT = int(os.getenv('WEB_PORT', '8000'))
 PING_INTERVAL = int(os.getenv('PING_INTERVAL', '25'))
 HEALTH_CHECK_ENDPOINT = "/health"
@@ -47,21 +47,16 @@ class BotApplication:
         self.site = None
         self.application = None
         self.keepalive_task = None
-        self.webserver_task = None
-        self.bot_task = None
-        self.loop = None
         self.shutting_down = False
+        self.update_lock = asyncio.Lock()  # Lock to prevent multiple getUpdates
 
     def load_token(self):
-        """Load token from token.json in root directory"""
+        """Load token from token.json"""
         try:
             with open(TOKEN_FILE, 'r') as token_file:
                 return json.load(token_file)
-        except FileNotFoundError:
-            logger.error(f"Token file {TOKEN_FILE} not found in root directory")
-            raise
-        except json.JSONDecodeError:
-            logger.error(f"Invalid JSON in {TOKEN_FILE}")
+        except Exception as e:
+            logger.error(f"Failed to load token: {e}")
             raise
 
     async def health_check(self, request):
@@ -109,7 +104,7 @@ class BotApplication:
         token_data = self.load_token()
         creds = Credentials.from_authorized_user_info(token_data, SCOPES)
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            creds.refresh(Request())  # Now using the imported Request
         return creds
 
     async def download_file_from_link(self, url, destination):
@@ -136,7 +131,7 @@ class BotApplication:
 
             with open(destination, 'wb') as file:
                 for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:  # filter out keep-alive new chunks
+                    if chunk:
                         file.write(chunk)
             return True, None
         except Exception as e:
@@ -149,14 +144,12 @@ class BotApplication:
             if not os.path.exists(archive_path):
                 return False, "❌ Archive file not found"
 
-            # Get folder name from archive filename (without extension)
             folder_name = os.path.splitext(os.path.basename(archive_path))[0]
             extract_dir = os.path.join(extract_dir, folder_name)
             os.makedirs(extract_dir, exist_ok=True)
 
             if zipfile.is_zipfile(archive_path):
                 with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-                    # Preserve all file and folder structure
                     for member in zip_ref.infolist():
                         try:
                             zip_ref.extract(member, extract_dir)
@@ -169,38 +162,12 @@ class BotApplication:
             logger.error(f"Extraction error: {e}")
             return False, f"❌ Extraction failed: {e}"
 
-    async def create_drive_folder(self, folder_name, parent_id=None):
-        """Create a folder in Google Drive"""
-        creds = self.authorize_google_drive()
-        service = build('drive', 'v3', credentials=creds)
-        file_metadata = {
-            'name': folder_name,
-            'mimeType': 'application/vnd.google-apps.folder'
-        }
-        if parent_id:
-            file_metadata['parents'] = [parent_id]
-        folder = service.files().create(body=file_metadata, fields='id').execute()
-        return folder.get('id')
-
-    async def upload_to_google_drive(self, file_path, file_name, parent_folder_id=None):
-        """Upload a file to Google Drive"""
-        creds = self.authorize_google_drive()
-        service = build('drive', 'v3', credentials=creds)
-        file_metadata = {'name': file_name}
-        if parent_folder_id:
-            file_metadata['parents'] = [parent_folder_id]
-        media = MediaFileUpload(file_path, resumable=True)
-        file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        return file.get('id')
-
     async def process_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Process a download link"""
         try:
             url = update.message.text.strip()
             
-            # Get filename from URL
             if "drive.google.com" in url:
-                # For Google Drive links, get the file name from API
                 file_id = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
                 if not file_id:
                     return await update.message.reply_text("❌ Invalid Google Drive link.")
@@ -210,9 +177,8 @@ class BotApplication:
                 file_info = service.files().get(fileId=file_id.group(1), fields='name').execute()
                 file_name = file_info['name']
             else:
-                # For direct links, use the last part of URL as filename
                 file_name = os.path.basename(urlparse(url).path.split('/')[-1] or "archive")
-                file_name = file_name.split('?')[0]  # Remove query params
+                file_name = file_name.split('?')[0]
                 
             file_path = os.path.join(tempfile.gettempdir(), file_name)
             
@@ -221,7 +187,6 @@ class BotApplication:
             if not success:
                 return await update.message.reply_text(error)
 
-            # Create temp directory for extraction
             temp_extract_dir = tempfile.mkdtemp()
             
             await update.message.reply_text("📦 Extracting files...")
@@ -230,7 +195,6 @@ class BotApplication:
                 shutil.rmtree(temp_extract_dir, ignore_errors=True)
                 return await update.message.reply_text(error)
 
-            # Get the extracted folder (named after the zip file)
             folder_name = os.path.splitext(os.path.basename(file_path))[0]
             extract_dir = os.path.join(temp_extract_dir, folder_name)
             
@@ -238,11 +202,17 @@ class BotApplication:
                 shutil.rmtree(temp_extract_dir, ignore_errors=True)
                 return await update.message.reply_text("❌ No files found in archive")
 
-            # Create folder in Google Drive
             await update.message.reply_text(f"📁 Creating folder '{folder_name}'...")
-            folder_id = await self.create_drive_folder(folder_name)
-
-            # Upload all files
+            creds = self.authorize_google_drive()
+            service = build('drive', 'v3', credentials=creds)
+            
+            folder_metadata = {
+                'name': folder_name,
+                'mimeType': 'application/vnd.google-apps.folder'
+            }
+            folder = service.files().create(body=folder_metadata, fields='id').execute()
+            folder_id = folder.get('id')
+            
             uploaded_files = []
             for root, _, files in os.walk(extract_dir):
                 for file in files:
@@ -250,11 +220,9 @@ class BotApplication:
                     relative_path = os.path.relpath(root, extract_dir)
                     current_parent = folder_id
                     
-                    # Create subfolder structure if needed
                     if relative_path != '.':
                         path_parts = relative_path.split(os.sep)
                         for part in path_parts:
-                            # Check if folder exists
                             query = f"name='{part}' and '{current_parent}' in parents and mimeType='application/vnd.google-apps.folder'"
                             results = service.files().list(q=query, fields="files(id)").execute()
                             items = results.get('files', [])
@@ -262,7 +230,6 @@ class BotApplication:
                             if items:
                                 current_parent = items[0]['id']
                             else:
-                                # Create new folder
                                 file_metadata = {
                                     'name': part,
                                     'mimeType': 'application/vnd.google-apps.folder',
@@ -271,7 +238,6 @@ class BotApplication:
                                 new_folder = service.files().create(body=file_metadata, fields='id').execute()
                                 current_parent = new_folder.get('id')
                     
-                    # Upload file
                     file_metadata = {
                         'name': file,
                         'parents': [current_parent]
@@ -324,11 +290,8 @@ class BotApplication:
         
         logger.info(f"Shutting down...")
         
-        # Cancel tasks
-        tasks = []
         if self.keepalive_task:
             self.keepalive_task.cancel()
-            tasks.append(self.keepalive_task)
         
         if self.application:
             try:
@@ -343,9 +306,6 @@ class BotApplication:
             await self.site.stop()
         if self.runner:
             await self.runner.cleanup()
-
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
         
         logger.info("Cleanup completed")
 
@@ -353,38 +313,37 @@ class BotApplication:
         """Run the Telegram bot"""
         self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         
-        # Command handlers
         self.application.add_handler(CommandHandler('start', self.start))
         self.application.add_handler(CommandHandler('help', self.help_command))
-        
-        # Message handler for processing links
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_link))
         
         await self.application.initialize()
         await self.application.start()
         
-        if not hasattr(self.application, 'updater') or not self.application.updater:
+        # Use a single persistent polling instance
+        if not hasattr(self.application, 'updater'):
             self.application.updater = self.application.bot
-        await self.application.updater.start_polling(drop_pending_updates=True)
+        await self.application.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
         
         logger.info("Bot started in polling mode")
 
     async def main(self):
         """Main application entry point"""
         try:
-            # Verify token.json exists
+            # Verify token exists
             self.load_token()
             
-            self.webserver_task = asyncio.create_task(self.run_webserver())
+            await self.run_webserver()
             self.keepalive_task = asyncio.create_task(self.self_ping())
-            self.bot_task = asyncio.create_task(self.run_bot())
+            await self.run_bot()
             
-            await asyncio.gather(
-                self.webserver_task,
-                self.keepalive_task,
-                self.bot_task,
-                return_exceptions=True
-            )
+            # Keep the application running
+            while True:
+                await asyncio.sleep(1)
+                
         except asyncio.CancelledError:
             logger.info("Shutting down gracefully...")
         except Exception as e:
