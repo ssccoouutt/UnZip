@@ -10,7 +10,6 @@ import asyncio
 import aiohttp
 import signal
 import time
-import psutil
 import warnings
 from datetime import datetime
 from urllib.parse import urlparse
@@ -50,7 +49,6 @@ WEB_PORT = int(os.getenv('WEB_PORT', '8000'))
 PING_INTERVAL = int(os.getenv('PING_INTERVAL', '25'))
 HEALTH_CHECK_ENDPOINT = "/health"
 MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024  # 5GB
-MAX_MEMORY_PERCENT = 90  # System memory threshold
 MAX_STARTUP_ATTEMPTS = 3
 
 # Initialize logging
@@ -94,9 +92,6 @@ class BotApplication:
                 "last_active": str(datetime.now()),
                 "bot_running": self.application is not None and self.application.running,
                 "webserver_running": self.site is not None,
-                "memory_usage": psutil.virtual_memory().percent,
-                "cpu_usage": psutil.cpu_percent(),
-                "active_tasks": len(asyncio.all_tasks()),
                 "timestamp": time.time()
             }
             return web.json_response(status)
@@ -109,11 +104,6 @@ class BotApplication:
         status = {
             "status": "operational" if not self.shutting_down else "shutting_down",
             "version": "1.0.0",
-            "system": {
-                "memory": psutil.virtual_memory()._asdict(),
-                "cpu": psutil.cpu_percent(),
-                "disk": psutil.disk_usage('/')._asdict()
-            },
             "services": {
                 "bot_running": self.application is not None and self.application.running,
                 "webserver_running": self.site is not None,
@@ -225,13 +215,8 @@ class BotApplication:
             return False, f"❌ Extraction failed: {e}"
 
     async def process_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Process a download link with resource monitoring"""
+        """Process a download link"""
         try:
-            # Check system resources before processing
-            if psutil.virtual_memory().percent > MAX_MEMORY_PERCENT:
-                await update.message.reply_text("⚠️ System resources low, please try again later")
-                return
-
             url = update.message.text.strip()
             
             if "drive.google.com" in url:
