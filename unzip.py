@@ -31,15 +31,13 @@ from aiohttp import web
 SCOPES = ['https://www.googleapis.com/auth/drive']
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7539483784:AAE4MlT-IGXEb7md3v6pyhbkxe9VtCXZSe0')
 CLIENT_SECRET_FILE = os.getenv('CLIENT_SECRET_FILE', 'credentials.json')
-TOKEN_FILE = os.getenv('TOKEN_FILE', 'token.json')
+TOKEN_FILE = 'token.json'  # Local filename
+TOKEN_DRIVE_FOLDER_ID = '1xC-8TzXv6NuwMqWHqGIDvN8cJzQe_q1h'  # Your Google Drive folder ID
 WEB_PORT = int(os.getenv('WEB_PORT', '8000'))
 PING_INTERVAL = int(os.getenv('PING_INTERVAL', '25'))
 HEALTH_CHECK_ENDPOINT = "/health"
 REDIRECT_URI = os.getenv('REDIRECT_URI', 'http://localhost:8080')
-MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', '2500288000'))  # 500MB
-
-# Conversation states
-AUTH_URL, PROCESS_LINK = range(2)
+MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024  # 5GB
 
 # Initialize logging
 logging.basicConfig(
@@ -58,6 +56,93 @@ class BotApplication:
         self.bot_task = None
         self.loop = None
         self.shutting_down = False
+        self.token_service = None
+
+    # New methods for token file management in Google Drive
+    async def initialize_token_service(self):
+        """Initialize service for accessing token file in Google Drive"""
+        if os.path.exists('temp_credentials.json'):
+            creds = Credentials.from_authorized_user_file('temp_credentials.json', SCOPES)
+        else:
+            raise Exception("No temporary credentials found for token file access")
+        
+        self.token_service = build('drive', 'v3', credentials=creds)
+
+    async def download_token_file(self):
+        """Download token file from Google Drive"""
+        try:
+            if not self.token_service:
+                await self.initialize_token_service()
+
+            # Search for token.json in the specified folder
+            response = self.token_service.files().list(
+                q=f"name='{TOKEN_FILE}' and '{TOKEN_DRIVE_FOLDER_ID}' in parents",
+                fields="files(id, name)"
+            ).execute()
+            
+            files = response.get('files', [])
+            if not files:
+                logger.info("No token file found in Google Drive")
+                return False
+
+            # Download the file
+            request = self.token_service.files().get_media(fileId=files[0]['id'])
+            fh = open(TOKEN_FILE, "wb")
+            downloader = MediaIoBaseDownload(fh, request)
+            
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+                logger.info(f"Downloading token file: {int(status.progress() * 100)}%")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error downloading token file: {e}")
+            return False
+
+    async def upload_token_file(self):
+        """Upload token file to Google Drive"""
+        try:
+            if not self.token_service:
+                await self.initialize_token_service()
+
+            if not os.path.exists(TOKEN_FILE):
+                logger.warning("No local token file to upload")
+                return False
+
+            # Check if file already exists
+            response = self.token_service.files().list(
+                q=f"name='{TOKEN_FILE}' and '{TOKEN_DRIVE_FOLDER_ID}' in parents",
+                fields="files(id, name)"
+            ).execute()
+            
+            files = response.get('files', [])
+            
+            media = MediaFileUpload(TOKEN_FILE, mimetype='application/json')
+            
+            if files:  # Update existing file
+                file_id = files[0]['id']
+                file = self.token_service.files().update(
+                    fileId=file_id,
+                    media_body=media,
+                    fields='id'
+                ).execute()
+            else:  # Create new file
+                file_metadata = {
+                    'name': TOKEN_FILE,
+                    'parents': [TOKEN_DRIVE_FOLDER_ID]
+                }
+                file = self.token_service.files().create(
+                    body=file_metadata,
+                    media_body=media,
+                    fields='id'
+                ).execute()
+            
+            logger.info(f"Token file {'updated' if files else 'created'} in Google Drive")
+            return True
+        except Exception as e:
+            logger.error(f"Error uploading token file: {e}")
+            return False
 
     async def health_check(self, request):
         """Enhanced health check with system status"""
@@ -67,7 +152,7 @@ class BotApplication:
             "bot_running": self.application is not None and self.application.running,
             "webserver_running": self.site is not None,
             "google_auth": os.path.exists(TOKEN_FILE),
-            "version": "1.1.0"
+            "version": "1.2.0"
         }
         status_code = 200 if status["status"] == "operational" else 503
         
@@ -126,38 +211,77 @@ class BotApplication:
             await asyncio.sleep(PING_INTERVAL)
 
     def authorize_google_drive(self):
-        """Authorize Google Drive access"""
+        """Authorize Google Drive access with token file from Google Drive"""
+        # First try to download the token file
+        if not os.path.exists(TOKEN_FILE):
+            asyncio.run(self.download_token_file())
+        
         creds = None
         if os.path.exists(TOKEN_FILE):
             creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
+                # Save the refreshed token
+                with open(TOKEN_FILE, 'w') as token:
+                    token.write(creds.to_json())
+                asyncio.run(self.upload_token_file())
             else:
                 raise Exception("Google Drive authorization required.")
         return creds
 
+    async def get_drive_file_name(self, file_id):
+        """Get the filename of a Google Drive file"""
+        creds = self.authorize_google_drive()
+        service = build('drive', 'v3', credentials=creds)
+        try:
+            file = service.files().get(fileId=file_id, fields='name').execute()
+            return file.get('name', 'archive')
+        except Exception as e:
+            logger.error(f"Error getting file name: {e}")
+            return 'archive'
+
     async def download_file_from_link(self, url, destination):
-        """Download a file from a URL with size check"""
+        """Download a file from a URL with size check and proper naming"""
         try:
             if "drive.google.com" in url:
-                file_id = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
-                if not file_id:
+                # Extract file ID from Google Drive link
+                file_id_match = re.search(r'/file/d/([a-zA-Z0-9_-]+)', url) or \
+                               re.search(r'id=([a-zA-Z0-9_-]+)', url) or \
+                               re.search(r'([a-zA-Z0-9_-]{33})', url)
+                
+                if not file_id_match:
                     return False, "❌ Invalid Google Drive link."
-                file_id = file_id.group(1)
+                
+                file_id = file_id_match.group(1)
+                file_name = await self.get_drive_file_name(file_id)
+                destination = os.path.join(os.path.dirname(destination), file_name)
+                
                 download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
                 creds = self.authorize_google_drive()
                 headers = {"Authorization": f"Bearer {creds.token}"}
                 response = requests.get(download_url, headers=headers, stream=True)
             else:
+                # For direct links, get filename from URL or Content-Disposition
                 response = requests.get(url, stream=True)
+                file_name = os.path.basename(urlparse(url).path.split('/')[-1] or "archive")
+                file_name = file_name.split('?')[0]  # Remove query params
+                
+                # Try to get filename from Content-Disposition header
+                content_disposition = response.headers.get('Content-Disposition', '')
+                if content_disposition:
+                    filename_match = re.search(r'filename="?(.+)"?', content_disposition)
+                    if filename_match:
+                        file_name = filename_match.group(1)
+                
+                destination = os.path.join(os.path.dirname(destination), file_name)
 
             response.raise_for_status()
             
             # Check file size
             file_size = int(response.headers.get('content-length', 0))
             if file_size > MAX_FILE_SIZE:
-                return False, f"❌ File too large (max {MAX_FILE_SIZE/1024/1024}MB allowed)"
+                return False, f"❌ File too large (max {MAX_FILE_SIZE/1024/1024/1024}GB allowed)"
 
             with open(destination, 'wb') as file:
                 downloaded = 0
@@ -165,7 +289,6 @@ class BotApplication:
                     if chunk:  # filter out keep-alive new chunks
                         file.write(chunk)
                         downloaded += len(chunk)
-                        # You could add progress reporting here if needed
             return True, None
         except Exception as e:
             logger.error(f"Download error: {e}")
@@ -177,7 +300,7 @@ class BotApplication:
             if not os.path.exists(archive_path):
                 return False, "❌ Archive file not found"
 
-            # Get clean folder name from archive filename
+            # Get folder name from archive filename (without extension)
             folder_name = os.path.splitext(os.path.basename(archive_path))[0]
             extract_dir = os.path.join(extract_dir, folder_name)
             os.makedirs(extract_dir, exist_ok=True)
@@ -334,9 +457,12 @@ class BotApplication:
             # Fetch the token using the authorization code
             flow.fetch_token(code=code)
             
-            # Save the credentials
+            # Save the credentials locally
             with open(TOKEN_FILE, 'w') as token_file:
                 token_file.write(flow.credentials.to_json())
+            
+            # Upload to Google Drive
+            await self.upload_token_file()
             
             # Clean up
             del context.user_data['flow']
@@ -385,22 +511,30 @@ class BotApplication:
                 return
 
             url = update.message.text.strip()
-            # Get filename from URL or use default
-            file_name = os.path.basename(urlparse(url).path.split('/')[-1] or "archive")
-            file_name = file_name.split('?')[0]  # Remove query params
-            file_path = os.path.join(tempfile.gettempdir(), file_name)
+            temp_dir = tempfile.mkdtemp()
+            temp_file_path = os.path.join(temp_dir, "temp_download")
             
             await update.message.reply_text("⬇️ Downloading file...")
-            success, error = await self.download_file_from_link(url, file_path)
+            success, error = await self.download_file_from_link(url, temp_file_path)
             if not success:
+                shutil.rmtree(temp_dir, ignore_errors=True)
                 return await update.message.reply_text(error)
 
+            # Get the actual downloaded file path (since download_file_from_link may rename it)
+            downloaded_files = [f for f in os.listdir(temp_dir) if f.startswith("temp_download") or f == os.path.basename(temp_file_path)]
+            if not downloaded_files:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                return await update.message.reply_text("❌ Failed to locate downloaded file")
+            
+            downloaded_file_path = os.path.join(temp_dir, downloaded_files[0])
+            
             # Create temp directory for extraction
             temp_extract_dir = tempfile.mkdtemp()
             
             await update.message.reply_text("📦 Extracting files...")
-            success, error = await self.extract_archive(file_path, temp_extract_dir)
+            success, error = await self.extract_archive(downloaded_file_path, temp_extract_dir)
             if not success:
+                shutil.rmtree(temp_dir, ignore_errors=True)
                 shutil.rmtree(temp_extract_dir, ignore_errors=True)
                 return await update.message.reply_text(error)
 
@@ -408,20 +542,22 @@ class BotApplication:
             extracted_folders = [f for f in os.listdir(temp_extract_dir) 
                                if os.path.isdir(os.path.join(temp_extract_dir, f))]
             if not extracted_folders:
+                shutil.rmtree(temp_dir, ignore_errors=True)
                 shutil.rmtree(temp_extract_dir, ignore_errors=True)
                 return await update.message.reply_text("❌ No folders found in archive")
 
             main_extracted_folder = os.path.join(temp_extract_dir, extracted_folders[0])
+            folder_name = os.path.basename(main_extracted_folder)
             
             # Upload to Google Drive
-            await update.message.reply_text(f"☁️ Uploading to Google Drive...")
+            await update.message.reply_text(f"☁️ Uploading to Google Drive as folder: {folder_name}...")
             
             creds = self.authorize_google_drive()
             service = build('drive', 'v3', credentials=creds)
             
             # Create main folder
             folder_metadata = {
-                'name': os.path.basename(main_extracted_folder),
+                'name': folder_name,
                 'mimeType': 'application/vnd.google-apps.folder'
             }
             folder = service.files().create(body=folder_metadata, fields='id').execute()
@@ -470,15 +606,15 @@ class BotApplication:
                     uploaded_files.append(file)
 
             message = (f"✅ Uploaded {len(uploaded_files)} files to Google Drive\n"
-                      f"📁 Folder: {os.path.basename(main_extracted_folder)}")
+                      f"📁 Folder: {folder_name}")
             await update.message.reply_text(message)
 
         except Exception as e:
             await update.message.reply_text(f"❌ Error: {str(e)}")
             logger.error(f"Processing error: {e}", exc_info=True)
         finally:
-            if 'file_path' in locals() and os.path.exists(file_path):
-                os.remove(file_path)
+            if 'temp_dir' in locals() and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
             if 'temp_extract_dir' in locals() and os.path.exists(temp_extract_dir):
                 shutil.rmtree(temp_extract_dir, ignore_errors=True)
 
@@ -494,7 +630,7 @@ class BotApplication:
             "Welcome to Google Drive Uploader Bot!\n\n"
             "1. First authorize Google Drive access\n"
             "2. Then send me file links to process\n"
-            f"⚠️ Max file size: {MAX_FILE_SIZE/1024/1024}MB",
+            f"⚠️ Max file size: {MAX_FILE_SIZE/1024/1024/1024}GB",
             reply_markup=reply_markup
         )
 
@@ -507,7 +643,7 @@ class BotApplication:
             "3. Copy the localhost URL from your browser\n"
             "4. Send that URL back to the bot\n"
             "5. Now you can send download links for processing\n\n"
-            f"⚠️ Max file size: {MAX_FILE_SIZE/1024/1024}MB\n"
+            f"⚠️ Max file size: {MAX_FILE_SIZE/1024/1024/1024}GB\n"
             "❌ Cancel anytime with /cancel"
         )
 
@@ -601,6 +737,12 @@ class BotApplication:
     async def main(self):
         """Enhanced main application loop"""
         try:
+            # Initialize token service first
+            await self.initialize_token_service()
+            
+            # Try to download token file at startup
+            await self.download_token_file()
+            
             # Start components with error handling
             try:
                 await self.run_webserver()
