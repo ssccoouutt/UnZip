@@ -55,6 +55,7 @@ class BotApplication:
         self.keepalive_task = None
         self.webserver_task = None
         self.bot_task = None
+        self.loop = None
 
     async def health_check(self, request):
         return web.Response(text=f"Bot operational | Last active: {datetime.now()}", status=200)
@@ -158,21 +159,38 @@ class BotApplication:
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
-            await update.message.reply_text(
-                "🔑 *Authorization Required*\n\n"
-                "1. Click this link to authorize:\n"
-                f"[Authorize Google Drive]({auth_url})\n\n"
-                "2. After approving, you'll get a localhost URL\n"
-                "3. Copy and send that URL back to me\n\n"
-                "⚠️ Ignore browser errors, just copy the URL",
-                parse_mode='Markdown',
-                disable_web_page_preview=True,
-                reply_markup=reply_markup
-            )
+            if update.callback_query:
+                await update.callback_query.message.reply_text(
+                    "🔑 *Authorization Required*\n\n"
+                    "1. Click this link to authorize:\n"
+                    f"[Authorize Google Drive]({auth_url})\n\n"
+                    "2. After approving, you'll get a localhost URL\n"
+                    "3. Copy and send that URL back to me\n\n"
+                    "⚠️ Ignore browser errors, just copy the URL",
+                    parse_mode='Markdown',
+                    disable_web_page_preview=True,
+                    reply_markup=reply_markup
+                )
+            else:
+                await update.message.reply_text(
+                    "🔑 *Authorization Required*\n\n"
+                    "1. Click this link to authorize:\n"
+                    f"[Authorize Google Drive]({auth_url})\n\n"
+                    "2. After approving, you'll get a localhost URL\n"
+                    "3. Copy and send that URL back to me\n\n"
+                    "⚠️ Ignore browser errors, just copy the URL",
+                    parse_mode='Markdown',
+                    disable_web_page_preview=True,
+                    reply_markup=reply_markup
+                )
             return AUTH_URL
 
         except Exception as e:
-            await update.message.reply_text(f"❌ Authorization error: {str(e)}")
+            error_msg = f"❌ Authorization error: {str(e)}"
+            if update.callback_query:
+                await update.callback_query.message.reply_text(error_msg)
+            else:
+                await update.message.reply_text(error_msg)
             logger.error(f"Authorization error: {e}")
             return ConversationHandler.END
 
@@ -181,7 +199,7 @@ class BotApplication:
         flow = context.user_data.get('flow')
         
         if not flow:
-            await update.message.reply_text("❌ No active authorization session.")
+            await update.message.reply_text("❌ No active authorization session. Please start authorization first using /auth")
             return ConversationHandler.END
 
         try:
@@ -202,7 +220,7 @@ class BotApplication:
                 token_file.write(flow.credentials.to_json())
             
             del context.user_data['flow']
-            await update.message.reply_text("✅ *Authorization Successful!*", parse_mode='Markdown')
+            await update.message.reply_text("✅ *Authorization Successful!* You can now send me download links.", parse_mode='Markdown')
             return ConversationHandler.END
 
         except Exception as e:
@@ -222,6 +240,10 @@ class BotApplication:
 
     async def process_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
+            if not os.path.exists(TOKEN_FILE):
+                await update.message.reply_text("❌ Google Drive authorization required. Please use /auth first.")
+                return ConversationHandler.END
+
             url = update.message.text.strip()
             file_name = os.path.basename(url.split('?')[0]) or "archive"
             file_path = os.path.join(tempfile.gettempdir(), file_name)
@@ -250,7 +272,7 @@ class BotApplication:
                     await self.upload_to_google_drive(file_path, file, folder_id)
                     uploaded_files.append(file)
 
-            message = f"✅ Uploaded {len(uploaded_files)} files to '{folder_name}'"
+            message = f"✅ Uploaded {len(uploaded_files)} files to Google Drive folder '{folder_name}'"
             await update.message.reply_text(message)
 
         except Exception as e:
@@ -314,49 +336,56 @@ class BotApplication:
         await query.answer()
         
         if query.data == 'start_auth':
-            await self.start_authorization(query, context)
+            await self.start_authorization(update, context)
         elif query.data == 'help':
-            await self.help_command(query, context)
+            await self.help_command(update, context)
         elif query.data == 'cancel_auth':
-            await self.cancel_auth(query, context)
+            await self.cancel_auth(update, context)
 
     async def shutdown(self, signal=None):
         logger.info(f"Received exit signal {signal.name if signal else 'manual'}...")
         
+        tasks = []
+        
+        # Shutdown bot application
         if self.app:
             try:
-                if hasattr(self.app, 'updater') and self.app.updater:
+                if hasattr(self.app, 'updater') and self.app.updater.running:
                     await self.app.updater.stop()
                 await self.app.stop()
                 await self.app.shutdown()
             except Exception as e:
                 logger.error(f"Error during bot shutdown: {e}")
-        
+
+        # Shutdown webserver
         if self.site:
-            await self.site.stop()
-        if self.runner:
-            await self.runner.cleanup()
+            try:
+                await self.site.stop()
+            except Exception as e:
+                logger.error(f"Error stopping site: {e}")
         
+        if self.runner:
+            try:
+                await self.runner.cleanup()
+            except Exception as e:
+                logger.error(f"Error cleaning up runner: {e}")
+
+        # Cancel tasks
         if self.keepalive_task:
             self.keepalive_task.cancel()
-            try:
-                await self.keepalive_task
-            except asyncio.CancelledError:
-                pass
+            tasks.append(self.keepalive_task)
         
         if self.webserver_task:
             self.webserver_task.cancel()
-            try:
-                await self.webserver_task
-            except asyncio.CancelledError:
-                pass
+            tasks.append(self.webserver_task)
         
         if self.bot_task:
             self.bot_task.cancel()
-            try:
-                await self.bot_task
-            except asyncio.CancelledError:
-                pass
+            tasks.append(self.bot_task)
+
+        # Wait for tasks to complete
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         
         logger.info("Cleanup completed")
 
@@ -367,7 +396,7 @@ class BotApplication:
             entry_points=[
                 CommandHandler('start', self.start),
                 CommandHandler('auth', self.start_authorization),
-                CallbackQueryHandler(self.button_handler)
+                CallbackQueryHandler(self.button_handler, pattern='^(start_auth|help|cancel_auth)$')
             ],
             states={
                 AUTH_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_auth_url)],
@@ -377,7 +406,7 @@ class BotApplication:
                 CommandHandler('cancel', self.cancel_auth),
                 CallbackQueryHandler(self.cancel_auth, pattern='^cancel_auth$')
             ],
-            per_message=False
+            per_message=True  # Changed to True to properly track callback queries
         )
         
         self.app.add_handler(conv_handler)
@@ -385,7 +414,9 @@ class BotApplication:
         
         await self.app.initialize()
         await self.app.start()
-        await self.app.updater.start_polling()
+        if not self.app.updater:
+            self.app.updater = self.app.bot
+        await self.app.updater.start_polling(drop_pending_updates=True)
         
         logger.info("Bot started in polling mode")
 
@@ -415,6 +446,7 @@ if __name__ == '__main__':
     asyncio.set_event_loop(loop)
     
     bot_app = BotApplication()
+    bot_app.loop = loop
     
     for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(
