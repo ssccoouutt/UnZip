@@ -51,7 +51,7 @@ class BotApplication:
     def __init__(self):
         self.runner = None
         self.site = None
-        self.application = None  # Changed from 'app' to 'application' for clarity
+        self.application = None
         self.keepalive_task = None
         self.webserver_task = None
         self.bot_task = None
@@ -79,7 +79,7 @@ class BotApplication:
         """Run the web server for health checks"""
         web_app = web.Application()
         web_app.router.add_get(HEALTH_CHECK_ENDPOINT, self.health_check)
-        web_app.router.add_get("/", self.root_handler)  # Added root handler
+        web_app.router.add_get("/", self.root_handler)
         
         self.runner = web.AppRunner(web_app)
         await self.runner.setup()
@@ -177,6 +177,10 @@ class BotApplication:
     async def start_authorization(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start Google Drive authorization process"""
         try:
+            # Clear any previous flow
+            if 'flow' in context.user_data:
+                del context.user_data['flow']
+
             flow = Flow.from_client_secrets_file(
                 CLIENT_SECRET_FILE,
                 scopes=SCOPES,
@@ -190,19 +194,30 @@ class BotApplication:
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
-            target = update.callback_query.message if update.callback_query else update.message
-            
-            await target.reply_text(
-                "🔑 *Authorization Required*\n\n"
-                "1. Click this link to authorize:\n"
-                f"[Authorize Google Drive]({auth_url})\n\n"
-                "2. After approving, you'll get a localhost URL\n"
-                "3. Copy and send that URL back to me\n\n"
-                "⚠️ Ignore browser errors, just copy the URL",
-                parse_mode='Markdown',
-                disable_web_page_preview=True,
-                reply_markup=reply_markup
-            )
+            if update.callback_query:
+                await update.callback_query.message.reply_text(
+                    "🔑 *Authorization Required*\n\n"
+                    "1. Click this link to authorize:\n"
+                    f"[Authorize Google Drive]({auth_url})\n\n"
+                    "2. After approving, you'll get a localhost URL\n"
+                    "3. Copy and send that URL back to me\n\n"
+                    "⚠️ Ignore browser errors, just copy the URL",
+                    parse_mode='Markdown',
+                    disable_web_page_preview=True,
+                    reply_markup=reply_markup
+                )
+            else:
+                await update.message.reply_text(
+                    "🔑 *Authorization Required*\n\n"
+                    "1. Click this link to authorize:\n"
+                    f"[Authorize Google Drive]({auth_url})\n\n"
+                    "2. After approving, you'll get a localhost URL\n"
+                    "3. Copy and send that URL back to me\n\n"
+                    "⚠️ Ignore browser errors, just copy the URL",
+                    parse_mode='Markdown',
+                    disable_web_page_preview=True,
+                    reply_markup=reply_markup
+                )
             return AUTH_URL
 
         except Exception as e:
@@ -217,36 +232,70 @@ class BotApplication:
     async def handle_auth_url(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle authorization callback URL"""
         url = update.message.text.strip()
-        flow = context.user_data.get('flow')
         
-        if not flow:
-            await update.message.reply_text("❌ No active authorization session. Please start authorization first using /auth")
+        # Check if we have an active flow
+        if 'flow' not in context.user_data:
+            await update.message.reply_text(
+                "❌ No active authorization session. Please start authorization first using /auth",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔑 Authorize Google Drive", callback_data='start_auth')]
+                ])
+            )
             return ConversationHandler.END
 
+        flow = context.user_data['flow']
+        
         try:
             parsed = urlparse(url)
             if not (parsed.netloc == 'localhost:8080' and parsed.scheme == 'http'):
-                await update.message.reply_text("❌ Invalid URL. Send the exact redirect URL.")
+                await update.message.reply_text(
+                    "❌ Invalid URL format. Please send the exact redirect URL you received after authorization.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ Cancel", callback_data='cancel_auth')]
+                    ])
+                )
                 return AUTH_URL
                 
             query = parse_qs(parsed.query)
             code = query.get('code', [None])[0]
             
             if not code:
-                await update.message.reply_text("❌ No authorization code found.")
+                await update.message.reply_text(
+                    "❌ No authorization code found in the URL.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ Cancel", callback_data='cancel_auth')]
+                    ])
+                )
                 return AUTH_URL
 
+            # Fetch the token using the authorization code
             flow.fetch_token(code=code)
+            
+            # Save the credentials
             with open(TOKEN_FILE, 'w') as token_file:
                 token_file.write(flow.credentials.to_json())
             
+            # Clean up
             del context.user_data['flow']
-            await update.message.reply_text("✅ *Authorization Successful!* You can now send me download links.", parse_mode='Markdown')
+            
+            await update.message.reply_text(
+                "✅ *Authorization Successful!*\n\nYou can now send me download links to process.",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🛠 Help", callback_data='help')]
+                ])
+            )
             return ConversationHandler.END
 
         except Exception as e:
-            await update.message.reply_text(f"❌ Authorization failed: {str(e)}")
             logger.error(f"Token exchange error: {e}")
+            await update.message.reply_text(
+                f"❌ Authorization failed: {str(e)}\n\nPlease try again.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Retry", callback_data='start_auth')],
+                    [InlineKeyboardButton("❌ Cancel", callback_data='cancel_auth')]
+                ])
+            )
             return AUTH_URL
 
     async def cancel_auth(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -264,8 +313,13 @@ class BotApplication:
         """Process a download link"""
         try:
             if not os.path.exists(TOKEN_FILE):
-                await update.message.reply_text("❌ Google Drive authorization required. Please use /auth first.")
-                return ConversationHandler.END
+                await update.message.reply_text(
+                    "❌ Google Drive authorization required. Please use /auth first.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔑 Authorize", callback_data='start_auth')]
+                    ])
+                )
+                return
 
             url = update.message.text.strip()
             file_name = os.path.basename(url.split('?')[0]) or "archive"
@@ -306,7 +360,6 @@ class BotApplication:
                 os.remove(file_path)
             if 'extract_dir' in locals() and os.path.exists(extract_dir):
                 shutil.rmtree(extract_dir, ignore_errors=True)
-        return ConversationHandler.END
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send welcome message"""
@@ -384,27 +437,34 @@ class BotApplication:
         """Run the Telegram bot"""
         self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         
-        # Fixed ConversationHandler configuration to avoid PTBUserWarning
-        conv_handler = ConversationHandler(
+        # Auth conversation handler
+        auth_conv = ConversationHandler(
             entry_points=[
-                CommandHandler('start', self.start),
                 CommandHandler('auth', self.start_authorization),
-                CallbackQueryHandler(self.button_handler, pattern='^start_auth$'),
-                CallbackQueryHandler(self.help_command, pattern='^help$'),
-                CallbackQueryHandler(self.cancel_auth, pattern='^cancel_auth$')
+                CallbackQueryHandler(self.start_authorization, pattern='^start_auth$')
             ],
             states={
-                AUTH_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_auth_url)],
-                PROCESS_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_link)]
+                AUTH_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_auth_url)]
             },
             fallbacks=[
                 CommandHandler('cancel', self.cancel_auth),
                 CallbackQueryHandler(self.cancel_auth, pattern='^cancel_auth$')
-            ]
+            ],
+            allow_reentry=True
         )
         
-        self.application.add_handler(conv_handler)
+        # Regular command handlers
+        self.application.add_handler(CommandHandler('start', self.start))
+        self.application.add_handler(CommandHandler('help', self.help_command))
+        
+        # Add conversation handlers
+        self.application.add_handler(auth_conv)
+        
+        # Add message handler for processing links
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_link))
+        
+        # Add callback query handler
+        self.application.add_handler(CallbackQueryHandler(self.button_handler))
         
         await self.application.initialize()
         await self.application.start()
