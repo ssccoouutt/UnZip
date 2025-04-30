@@ -9,6 +9,9 @@ import requests
 import asyncio
 import aiohttp
 import signal
+import time
+import psutil
+import warnings
 from datetime import datetime
 from urllib.parse import urlparse
 from telegram import Update
@@ -20,10 +23,24 @@ from telegram.ext import (
     filters
 )
 from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request  # Added missing import
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.discovery_cache.base import Cache
 from aiohttp import web
+
+# Suppress Google API cache warning
+warnings.filterwarnings("ignore", "file_cache is only supported")
+
+# Custom memory cache for Google API
+class MemoryCache(Cache):
+    _CACHE = {}
+
+    def get(self, url):
+        return MemoryCache._CACHE.get(url)
+
+    def set(self, url, content):
+        MemoryCache._CACHE[url] = content
 
 # Configuration
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -33,6 +50,8 @@ WEB_PORT = int(os.getenv('WEB_PORT', '8000'))
 PING_INTERVAL = int(os.getenv('PING_INTERVAL', '25'))
 HEALTH_CHECK_ENDPOINT = "/health"
 MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024  # 5GB
+MAX_MEMORY_PERCENT = 90  # System memory threshold
+MAX_STARTUP_ATTEMPTS = 3
 
 # Initialize logging
 logging.basicConfig(
@@ -48,24 +67,58 @@ class BotApplication:
         self.application = None
         self.keepalive_task = None
         self.shutting_down = False
-        self.update_lock = asyncio.Lock()  # Lock to prevent multiple getUpdates
+        self.startup_attempts = 0
 
     def load_token(self):
-        """Load token from token.json"""
+        """Load token from token.json with validation"""
         try:
+            if not os.path.exists(TOKEN_FILE):
+                raise FileNotFoundError(f"Token file {TOKEN_FILE} not found")
+            
             with open(TOKEN_FILE, 'r') as token_file:
-                return json.load(token_file)
+                token_data = json.load(token_file)
+                
+            if not all(key in token_data for key in ['token', 'refresh_token', 'client_id', 'client_secret']):
+                raise ValueError("Invalid token file structure")
+                
+            return token_data
         except Exception as e:
             logger.error(f"Failed to load token: {e}")
             raise
 
     async def health_check(self, request):
-        """Health check endpoint"""
+        """Comprehensive health check endpoint"""
+        try:
+            status = {
+                "status": "operational" if not self.shutting_down else "shutting_down",
+                "last_active": str(datetime.now()),
+                "bot_running": self.application is not None and self.application.running,
+                "webserver_running": self.site is not None,
+                "memory_usage": psutil.virtual_memory().percent,
+                "cpu_usage": psutil.cpu_percent(),
+                "active_tasks": len(asyncio.all_tasks()),
+                "timestamp": time.time()
+            }
+            return web.json_response(status)
+        except Exception as e:
+            logger.error(f"Health check error: {e}")
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    async def status_handler(self, request):
+        """Detailed status endpoint"""
         status = {
             "status": "operational" if not self.shutting_down else "shutting_down",
-            "last_active": str(datetime.now()),
-            "bot_running": self.application is not None and self.application.running,
-            "webserver_running": self.site is not None
+            "version": "1.0.0",
+            "system": {
+                "memory": psutil.virtual_memory()._asdict(),
+                "cpu": psutil.cpu_percent(),
+                "disk": psutil.disk_usage('/')._asdict()
+            },
+            "services": {
+                "bot_running": self.application is not None and self.application.running,
+                "webserver_running": self.site is not None,
+                "last_ping": str(datetime.now())
+            }
         }
         return web.json_response(status)
 
@@ -74,22 +127,23 @@ class BotApplication:
         return web.Response(text="Google Drive Uploader Bot is running")
 
     async def run_webserver(self):
-        """Run the web server for health checks"""
+        """Run the web server for health checks and monitoring"""
         web_app = web.Application()
         web_app.router.add_get(HEALTH_CHECK_ENDPOINT, self.health_check)
+        web_app.router.add_get("/status", self.status_handler)
         web_app.router.add_get("/", self.root_handler)
         
         self.runner = web.AppRunner(web_app)
         await self.runner.setup()
         self.site = web.TCPSite(self.runner, '0.0.0.0', WEB_PORT)
         await self.site.start()
-        logger.info(f"Health check server running on port {WEB_PORT}")
+        logger.info(f"Web server running on port {WEB_PORT}")
 
     async def self_ping(self):
-        """Keep-alive mechanism"""
+        """Keep-alive mechanism with error handling"""
         while not self.shutting_down:
             try:
-                async with aiohttp.ClientSession() as session:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                     async with session.get(f'http://localhost:{WEB_PORT}{HEALTH_CHECK_ENDPOINT}') as resp:
                         if resp.status != 200:
                             logger.warning(f"Health check failed with status {resp.status}")
@@ -104,39 +158,47 @@ class BotApplication:
         token_data = self.load_token()
         creds = Credentials.from_authorized_user_info(token_data, SCOPES)
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())  # Now using the imported Request
+            creds.refresh(Request())
         return creds
 
     async def download_file_from_link(self, url, destination):
-        """Download a file from a URL with size check"""
-        try:
-            if "drive.google.com" in url:
-                file_id = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
-                if not file_id:
-                    return False, "❌ Invalid Google Drive link."
-                file_id = file_id.group(1)
-                download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-                creds = self.authorize_google_drive()
-                headers = {"Authorization": f"Bearer {creds.token}"}
-                response = requests.get(download_url, headers=headers, stream=True)
-            else:
-                response = requests.get(url, stream=True)
+        """Download a file from a URL with size check and retries"""
+        max_retries = 3
+        retry_delay = 5
+        
+        for attempt in range(max_retries):
+            try:
+                if "drive.google.com" in url:
+                    file_id = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+                    if not file_id:
+                        return False, "❌ Invalid Google Drive link."
+                    file_id = file_id.group(1)
+                    download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+                    creds = self.authorize_google_drive()
+                    headers = {"Authorization": f"Bearer {creds.token}"}
+                    response = requests.get(download_url, headers=headers, stream=True)
+                else:
+                    response = requests.get(url, stream=True)
 
-            response.raise_for_status()
-            
-            # Check file size
-            file_size = int(response.headers.get('content-length', 0))
-            if file_size > MAX_FILE_SIZE:
-                return False, f"❌ File too large (max 5GB allowed)"
+                response.raise_for_status()
+                
+                # Check file size
+                file_size = int(response.headers.get('content-length', 0))
+                if file_size > MAX_FILE_SIZE:
+                    return False, f"❌ File too large (max 5GB allowed)"
 
-            with open(destination, 'wb') as file:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        file.write(chunk)
-            return True, None
-        except Exception as e:
-            logger.error(f"Download error: {e}")
-            return False, f"❌ Download failed: {e}"
+                with open(destination, 'wb') as file:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            file.write(chunk)
+                return True, None
+                
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"Download failed after {max_retries} attempts: {e}")
+                    return False, f"❌ Download failed: {e}"
+                logger.warning(f"Download attempt {attempt + 1} failed, retrying...")
+                await asyncio.sleep(retry_delay)
 
     async def extract_archive(self, archive_path, extract_dir):
         """Extract files from an archive with proper folder structure"""
@@ -163,8 +225,13 @@ class BotApplication:
             return False, f"❌ Extraction failed: {e}"
 
     async def process_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Process a download link"""
+        """Process a download link with resource monitoring"""
         try:
+            # Check system resources before processing
+            if psutil.virtual_memory().percent > MAX_MEMORY_PERCENT:
+                await update.message.reply_text("⚠️ System resources low, please try again later")
+                return
+
             url = update.message.text.strip()
             
             if "drive.google.com" in url:
@@ -173,7 +240,7 @@ class BotApplication:
                     return await update.message.reply_text("❌ Invalid Google Drive link.")
                 
                 creds = self.authorize_google_drive()
-                service = build('drive', 'v3', credentials=creds)
+                service = build('drive', 'v3', credentials=creds, cache=MemoryCache())
                 file_info = service.files().get(fileId=file_id.group(1), fields='name').execute()
                 file_name = file_info['name']
             else:
@@ -204,7 +271,7 @@ class BotApplication:
 
             await update.message.reply_text(f"📁 Creating folder '{folder_name}'...")
             creds = self.authorize_google_drive()
-            service = build('drive', 'v3', credentials=creds)
+            service = build('drive', 'v3', credentials=creds, cache=MemoryCache())
             
             folder_metadata = {
                 'name': folder_name,
@@ -268,7 +335,8 @@ class BotApplication:
             "Welcome to Google Drive Uploader Bot!\n\n"
             "Send me a direct download link or Google Drive link to a ZIP file\n"
             "I'll extract and upload its contents to Google Drive\n\n"
-            "⚠️ Max file size: 5GB"
+            "⚠️ Max file size: 5GB\n"
+            "❌ Only ZIP files are supported"
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -279,7 +347,10 @@ class BotApplication:
             "2. I'll download, extract and upload the contents to Google Drive\n"
             "3. Files will be organized in a folder with the same name as the ZIP file\n\n"
             "⚠️ Max file size: 5GB\n"
-            "❌ Only ZIP files are supported"
+            "❌ Only ZIP files are supported\n\n"
+            "Commands:\n"
+            "/start - Show welcome message\n"
+            "/help - Show this help message"
         )
 
     async def shutdown(self, signal=None):
@@ -292,6 +363,10 @@ class BotApplication:
         
         if self.keepalive_task:
             self.keepalive_task.cancel()
+            try:
+                await self.keepalive_task
+            except asyncio.CancelledError:
+                pass
         
         if self.application:
             try:
@@ -310,7 +385,7 @@ class BotApplication:
         logger.info("Cleanup completed")
 
     async def run_bot(self):
-        """Run the Telegram bot"""
+        """Run the Telegram bot with error handling"""
         self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         
         self.application.add_handler(CommandHandler('start', self.start))
@@ -325,31 +400,44 @@ class BotApplication:
             self.application.updater = self.application.bot
         await self.application.updater.start_polling(
             drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
+            allowed_updates=Update.ALL_TYPES,
+            timeout=60
         )
         
         logger.info("Bot started in polling mode")
 
     async def main(self):
-        """Main application entry point"""
-        try:
-            # Verify token exists
-            self.load_token()
-            
-            await self.run_webserver()
-            self.keepalive_task = asyncio.create_task(self.self_ping())
-            await self.run_bot()
-            
-            # Keep the application running
-            while True:
-                await asyncio.sleep(1)
+        """Main application entry point with retry logic"""
+        while self.startup_attempts < MAX_STARTUP_ATTEMPTS and not self.shutting_down:
+            try:
+                self.startup_attempts += 1
+                logger.info(f"Starting application (attempt {self.startup_attempts}/{MAX_STARTUP_ATTEMPTS})")
                 
-        except asyncio.CancelledError:
-            logger.info("Shutting down gracefully...")
-        except Exception as e:
-            logger.error(f"Fatal error: {e}")
-        finally:
-            await self.shutdown()
+                # Verify token exists
+                self.load_token()
+                
+                await self.run_webserver()
+                self.keepalive_task = asyncio.create_task(self.self_ping())
+                await self.run_bot()
+                
+                # Reset startup attempts after successful start
+                self.startup_attempts = 0
+                
+                # Keep the application running
+                while True:
+                    await asyncio.sleep(1)
+                    
+            except asyncio.CancelledError:
+                logger.info("Shutting down gracefully...")
+                break
+            except Exception as e:
+                logger.error(f"Startup attempt {self.startup_attempts} failed: {e}")
+                if self.startup_attempts >= MAX_STARTUP_ATTEMPTS:
+                    logger.error("Max startup attempts reached, giving up")
+                    break
+                await asyncio.sleep(5)  # Wait before retrying
+            finally:
+                await self.shutdown()
 
 def handle_signal(bot_app, signal):
     """Handle shutdown signals"""
@@ -360,7 +448,6 @@ if __name__ == '__main__':
     asyncio.set_event_loop(loop)
     
     bot_app = BotApplication()
-    bot_app.loop = loop
     
     # Register signal handlers
     for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
@@ -374,4 +461,6 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"Fatal error: {e}")
     finally:
-        loop.close()
+        if not loop.is_closed():
+            loop.close()
+        logger.info("Application stopped")
