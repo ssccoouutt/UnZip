@@ -31,11 +31,12 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7539483784:AAE4MlT-IGXEb7md3v6pyhbkxe9VtCXZSe0')
 TOKEN_FILE = 'token.json'
 WEB_PORT = int(os.getenv('WEB_PORT', '8000'))
-PING_INTERVAL = int(os.getenv('PING_INTERVAL', '30'))  # Increased from 25 to 30
+PING_INTERVAL = int(os.getenv('PING_INTERVAL', '30'))
 HEALTH_CHECK_ENDPOINT = "/health"
 MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024  # 5GB
-HEALTH_CHECK_TIMEOUT = 5  # seconds
+HEALTH_CHECK_TIMEOUT = 10  # seconds
 MAX_UPLOAD_TIME = 1800  # 30 minutes max for upload operations
+MAX_CONCURRENT_UPLOADS = 2  # Limit concurrent uploads to prevent resource exhaustion
 
 # Initialize logging
 logging.basicConfig(
@@ -56,11 +57,27 @@ class BotApplication:
         self.active_operations = 0
         self.session = None
         self.loop = asyncio.get_event_loop()
+        self.upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
+        self.health_check_lock = asyncio.Lock()
 
     async def init_session(self):
-        """Initialize aiohttp session"""
-        timeout = aiohttp.ClientTimeout(total=HEALTH_CHECK_TIMEOUT)
-        self.session = aiohttp.ClientSession(timeout=timeout)
+        """Initialize aiohttp session with increased timeouts"""
+        timeout = aiohttp.ClientTimeout(
+            total=HEALTH_CHECK_TIMEOUT,
+            connect=5,
+            sock_connect=5,
+            sock_read=5
+        )
+        connector = aiohttp.TCPConnector(
+            limit=10,
+            force_close=True,
+            enable_cleanup_closed=True
+        )
+        self.session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+            trust_env=True
+        )
 
     def load_token(self):
         """Load token from token.json with validation"""
@@ -82,84 +99,64 @@ class BotApplication:
             raise
 
     async def health_check(self, request):
-        """Comprehensive health check with system status"""
-        self.last_activity = time.time()
-        
-        try:
-            # Check basic system health
-            uptime = str(timedelta(seconds=time.time() - self.start_time))
-            status = {
-                "status": "healthy",
-                "uptime": uptime,
-                "last_activity": datetime.fromtimestamp(self.last_activity).isoformat(),
-                "active_operations": self.active_operations,
-                "shutting_down": self.shutting_down,
-                "telegram_connected": self.application is not None and self.application.updater is not None,
-                "google_auth_ready": self.test_google_auth(),
-                "memory_usage": self.get_memory_usage(),
-                "disk_space": self.get_disk_space()
-            }
-            
-            return web.json_response(status)
-        except Exception as e:
-            logger.error(f"Health check error: {e}")
-            return web.json_response(
-                {"status": "error", "error": str(e)},
-                status=500
-            )
+        """Health check with operation awareness"""
+        async with self.health_check_lock:
+            try:
+                # Skip health check if we're in the middle of an upload
+                if self.active_operations > 0:
+                    return web.json_response(
+                        {"status": "degraded", "reason": "active_operations", "count": self.active_operations},
+                        status=202
+                    )
+
+                # Basic system health check
+                uptime = str(timedelta(seconds=time.time() - self.start_time))
+                status = {
+                    "status": "healthy",
+                    "uptime": uptime,
+                    "last_activity": datetime.fromtimestamp(self.last_activity).isoformat(),
+                    "active_operations": self.active_operations,
+                    "telegram_connected": self.application is not None and self.application.updater is not None,
+                    "google_auth_ready": self.test_google_auth(),
+                }
+                
+                return web.json_response(status)
+            except Exception as e:
+                logger.error(f"Health check error: {e}")
+                return web.json_response(
+                    {"status": "error", "error": str(e)},
+                    status=500
+                )
 
     def test_google_auth(self):
-        """Test Google auth connectivity"""
+        """Test Google auth connectivity with timeout"""
         try:
             creds = self.authorize_google_drive()
             return creds.valid
         except:
             return False
 
-    def get_memory_usage(self):
-        """Get memory usage in MB"""
-        try:
-            import psutil
-            process = psutil.Process(os.getpid())
-            return f"{process.memory_info().rss / 1024 / 1024:.2f} MB"
-        except ImportError:
-            return "N/A (psutil not installed)"
-
-    def get_disk_space(self):
-        """Get disk space information"""
-        try:
-            import psutil
-            usage = psutil.disk_usage('/')
-            return {
-                "total": f"{usage.total / 1024 / 1024:.2f} MB",
-                "used": f"{usage.used / 1024 / 1024:.2f} MB",
-                "free": f"{usage.free / 1024 / 1024:.2f} MB",
-                "percent": f"{usage.percent}%"
-            }
-        except ImportError:
-            return "N/A (psutil not installed)"
-
-    async def root_handler(self, request):
-        """Simple root endpoint with more information"""
-        return web.Response(
-            text="Google Drive Uploader Bot\n\n"
-                 f"Uptime: {timedelta(seconds=time.time() - self.start_time)}\n"
-                 f"Last activity: {datetime.fromtimestamp(self.last_activity)}\n"
-                 f"Active operations: {self.active_operations}\n\n"
-                 f"Health check: http://{request.host}{HEALTH_CHECK_ENDPOINT}",
-            headers={"Content-Type": "text/plain"}
-        )
-
     async def run_webserver(self):
-        """Run the web server for health checks with error handling"""
+        """Run the web server with increased limits"""
         try:
-            app = web.Application()
+            app = web.Application(client_max_size=1024*1024*10)  # 10MB max request size
             app.router.add_get(HEALTH_CHECK_ENDPOINT, self.health_check)
             app.router.add_get("/", self.root_handler)
             
-            self.runner = web.AppRunner(app)
+            self.runner = web.AppRunner(
+                app,
+                access_log=logger,
+                handle_signals=True
+            )
             await self.runner.setup()
-            self.site = web.TCPSite(self.runner, '0.0.0.0', WEB_PORT)
+            
+            self.site = web.TCPSite(
+                self.runner,
+                '0.0.0.0',
+                WEB_PORT,
+                reuse_port=True,
+                shutdown_timeout=5
+            )
             await self.site.start()
             logger.info(f"Health check server running on port {WEB_PORT}")
             return True
@@ -168,24 +165,24 @@ class BotApplication:
             return False
 
     async def self_ping(self):
-        """Improved keep-alive mechanism with backoff"""
+        """Improved keep-alive with circuit breaker"""
         retry_count = 0
-        max_retries = 5
+        max_retries = 3
         base_delay = 5
         
         while not self.shutting_down:
             try:
-                if not self.session or self.session.closed:
-                    await self.init_session()
-                
-                async with self.session.get(f'http://localhost:{WEB_PORT}{HEALTH_CHECK_ENDPOINT}') as resp:
+                async with self.session.get(
+                    f'http://localhost:{WEB_PORT}{HEALTH_CHECK_ENDPOINT}',
+                    timeout=HEALTH_CHECK_TIMEOUT
+                ) as resp:
                     if resp.status == 200:
                         retry_count = 0
                         data = await resp.json()
-                        logger.debug(f"Keepalive ping successful. Status: {data.get('status')}")
+                        if data.get('status') != 'healthy':
+                            raise Exception(f"Degraded status: {data.get('reason', 'unknown')}")
                     else:
-                        logger.warning(f"Keepalive ping failed with status {resp.status}")
-                        raise aiohttp.ClientError(f"Status {resp.status}")
+                        raise Exception(f"Status {resp.status}")
                 
                 # Write last active time
                 with open('/tmp/last_active.txt', 'w') as f:
@@ -200,26 +197,9 @@ class BotApplication:
                     await self.shutdown()
                     return
                 
-                delay = min(base_delay * (2 ** retry_count), 300)  # Exponential backoff with max 5 min
+                delay = min(base_delay * (2 ** retry_count), 60)  # Cap at 1 minute
                 logger.warning(f"Keepalive error (attempt {retry_count}/{max_retries}): {e}. Retrying in {delay}s")
                 await asyncio.sleep(delay)
-
-    def authorize_google_drive(self):
-        """Authorize Google Drive with token refresh"""
-        try:
-            token_data = self.load_token()
-            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
-            
-            if not creds or not creds.valid:
-                if creds and creds.expired and creds.refresh_token:
-                    creds.refresh(Request())
-                else:
-                    raise ValueError("Invalid credentials")
-                    
-            return creds
-        except Exception as e:
-            logger.error(f"Google Drive authorization failed: {e}")
-            raise
 
     async def download_file_from_link(self, url, destination):
         """Download file with retries and proper cleanup"""
@@ -272,54 +252,25 @@ class BotApplication:
             if 'response' in locals():
                 response.close()
 
-    async def extract_archive(self, archive_path, extract_dir):
-        """Extract files from archive with validation"""
-        try:
-            if not os.path.exists(archive_path):
-                return False, "❌ Archive file not found"
-
-            # Validate file is actually a zip
-            if not zipfile.is_zipfile(archive_path):
-                return False, "❌ Only ZIP files supported"
-
-            folder_name = os.path.splitext(os.path.basename(archive_path))[0]
-            extract_dir = os.path.join(extract_dir, folder_name)
-            os.makedirs(extract_dir, exist_ok=True)
-
-            # Test zip file integrity first
-            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-                bad_file = zip_ref.testzip()
-                if bad_file:
-                    return False, f"❌ Corrupted ZIP file (bad file: {bad_file})"
-
-                # Now actually extract
-                zip_ref.extractall(extract_dir)
-
-            return True, None
-            
-        except zipfile.BadZipFile:
-            return False, "❌ Corrupted or invalid ZIP file"
-        except Exception as e:
-            return False, f"❌ Extraction failed: {str(e)}"
-
     async def process_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Process download link with operation tracking"""
         self.active_operations += 1
         self.last_activity = time.time()
         
         try:
-            url = update.message.text.strip()
-            
-            # Validate URL format
-            if not re.match(r'^https?://', url, re.IGNORECASE):
-                return await update.message.reply_text("❌ Invalid URL format. Please provide a valid HTTP/HTTPS link.")
+            async with self.upload_semaphore:
+                url = update.message.text.strip()
+                
+                # Validate URL format
+                if not re.match(r'^https?://', url, re.IGNORECASE):
+                    return await update.message.reply_text("❌ Invalid URL format. Please provide a valid HTTP/HTTPS link.")
 
-            # Start processing with timeout
-            await asyncio.wait_for(
-                self._process_link_internal(update, url),
-                timeout=MAX_UPLOAD_TIME
-            )
-            
+                # Start processing with timeout
+                await asyncio.wait_for(
+                    self._process_link_internal(update, url),
+                    timeout=MAX_UPLOAD_TIME
+                )
+                
         except asyncio.TimeoutError:
             await update.message.reply_text("❌ Operation timed out (30 minutes max)")
             logger.error(f"Timeout processing link: {url}")
@@ -483,30 +434,6 @@ class BotApplication:
                 except Exception as e:
                     logger.warning(f"Failed to remove temp dir: {e}")
 
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send welcome message"""
-        self.last_activity = time.time()
-        await update.message.reply_text(
-            "Welcome to Google Drive Uploader Bot!\n\n"
-            "Send me a direct download link or Google Drive link to a ZIP file\n"
-            "I'll extract and upload its contents to Google Drive\n\n"
-            "⚠️ Max file size: 5GB\n"
-            "❌ Only ZIP files are supported"
-        )
-
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send help message"""
-        self.last_activity = time.time()
-        await update.message.reply_text(
-            "📚 How to use this bot:\n\n"
-            "1. Send me a direct download link or Google Drive link to a ZIP file\n"
-            "2. I'll download, extract and upload the contents to Google Drive\n"
-            "3. Files will be organized in a folder with the same name as the ZIP file\n\n"
-            "⚠️ Max file size: 5GB\n"
-            "❌ Only ZIP files are supported\n\n"
-            "For large files, please be patient as uploads may take time"
-        )
-
     async def shutdown(self):
         """Graceful shutdown with proper cleanup"""
         if self.shutting_down:
@@ -554,33 +481,6 @@ class BotApplication:
                 
         logger.info("Shutdown completed")
 
-    async def run_bot(self):
-        """Run the Telegram bot with error handling"""
-        try:
-            self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-            
-            self.application.add_handler(CommandHandler('start', self.start))
-            self.application.add_handler(CommandHandler('help', self.help_command))
-            self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_link))
-            
-            await self.application.initialize()
-            await self.application.start()
-            
-            # Start polling with clean state
-            await self.application.updater.start_polling(
-                drop_pending_updates=True,
-                timeout=30,
-                poll_interval=1.0,
-                allowed_updates=Update.ALL_TYPES
-            )
-            
-            logger.info("Bot started successfully")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to start bot: {e}")
-            return False
-
     async def main(self):
         """Main application entry point with proper initialization"""
         try:
@@ -590,9 +490,22 @@ class BotApplication:
             if not await self.run_webserver():
                 raise RuntimeError("Failed to start web server")
                 
-            if not await self.run_bot():
-                raise RuntimeError("Failed to start Telegram bot")
-                
+            self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+            self.application.add_handler(CommandHandler('start', self.start))
+            self.application.add_handler(CommandHandler('help', self.help_command))
+            self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_link))
+            
+            await self.application.initialize()
+            await self.application.start()
+            await self.application.updater.start_polling(
+                drop_pending_updates=True,
+                timeout=30,
+                poll_interval=1.0,
+                allowed_updates=Update.ALL_TYPES
+            )
+            
+            logger.info("Bot started successfully")
+            
             # Start keepalive after everything else is running
             self.keepalive_task = asyncio.create_task(self.self_ping())
             
@@ -607,16 +520,11 @@ class BotApplication:
         finally:
             await self.shutdown()
 
-async def shutdown_handler(signal, loop, bot_app):
-    """Handle shutdown signals gracefully"""
-    logger.info(f"Received {signal.name}, initiating shutdown...")
-    await bot_app.shutdown()
-    loop.stop()
-
 if __name__ == '__main__':
-    # Configure event loop
+    # Configure event loop with debug
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    loop.set_debug(True)
     
     # Create application
     bot_app = BotApplication()
@@ -625,7 +533,7 @@ if __name__ == '__main__':
     signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
     for s in signals:
         loop.add_signal_handler(
-            s, lambda s=s: asyncio.create_task(shutdown_handler(s, loop, bot_app))
+            s, lambda s=s: asyncio.create_task(bot_app.shutdown())
         )
     
     try:
