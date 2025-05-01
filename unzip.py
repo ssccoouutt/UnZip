@@ -57,6 +57,7 @@ class BotApplication:
         self.shutting_down = False
         self.startup_attempts = 0
         self.last_activity = time.time()
+        self.start_time = time.time()
 
     def load_token(self):
         """Load token from token.json with validation"""
@@ -121,21 +122,14 @@ class BotApplication:
         web_app.router.add_get("/status", self.status_handler)
         web_app.router.add_get("/", self.root_handler)
         
-        # Configure server with timeouts that match health check requirements
+        # Configure server with compatible settings
         self.runner = web.AppRunner(web_app, access_log=None)
         await self.runner.setup()
         
-        # Use keepalive_timeout=75 to match Koyeb's expectations
-        self.site = web.TCPSite(
-            self.runner, 
-            '0.0.0.0', 
-            WEB_PORT,
-            reuse_port=True,
-            backlog=100,
-            keepalive_timeout=75
-        )
+        # Use compatible TCPSite initialization
+        self.site = web.TCPSite(self.runner, '0.0.0.0', WEB_PORT)
         await self.site.start()
-        logger.info(f"Web server running on port {WEB_PORT} with optimized settings")
+        logger.info(f"Web server running on port {WEB_PORT}")
 
     async def self_ping(self):
         """Keepalive mechanism that never fails"""
@@ -414,10 +408,7 @@ class BotApplication:
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
             poll_interval=0.5,
-            timeout=30,
-            connect_timeout=30,
-            read_timeout=30,
-            write_timeout=30
+            timeout=30
         )
         
         logger.info("Bot started in optimized polling mode")
