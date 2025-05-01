@@ -67,18 +67,18 @@ class BotApplication:
     async def health_check(self, request):
         """Simplified health check that always succeeds"""
         self.last_activity = time.time()
-        return web.json_response({
-            "status": "operational",
-            "timestamp": datetime.now().isoformat(),
-            "uptime": time.time() - self.start_time
-        })
+        return web.Response(
+            text=f"🤖 Bot is operational | Last active: {datetime.now()}",
+            headers={"Content-Type": "text/plain"},
+            status=200
+        )
 
     async def root_handler(self, request):
         """Simple root endpoint"""
         return web.Response(text="Google Drive Uploader Bot is running")
 
     async def run_webserver(self):
-        """Run a simple web server for health checks"""
+        """Run the web server for health checks"""
         app = web.Application()
         app.router.add_get(HEALTH_CHECK_ENDPOINT, self.health_check)
         app.router.add_get("/", self.root_handler)
@@ -90,10 +90,14 @@ class BotApplication:
         logger.info(f"Health check server running on port {WEB_PORT}")
 
     async def self_ping(self):
-        """Basic keepalive mechanism"""
+        """Keep-alive mechanism"""
         while not self.shutting_down:
             try:
-                self.last_activity = time.time()
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f'http://localhost:{WEB_PORT}{HEALTH_CHECK_ENDPOINT}') as resp:
+                        status = f"Status: {resp.status}" if resp.status != 200 else "Success"
+                        logger.info(f"Keepalive ping {status}")
+                
                 with open('/tmp/last_active.txt', 'w') as f:
                     f.write(str(datetime.now()))
             except Exception as e:
@@ -345,9 +349,16 @@ class BotApplication:
         finally:
             await self.shutdown()
 
-def handle_signal(bot_app, signal):
-    """Handle shutdown signals"""
-    asyncio.create_task(bot_app.shutdown())
+async def shutdown(signal, loop):
+    """Cleanup tasks tied to the service's shutdown."""
+    logger.info(f"Received exit signal {signal.name}...")
+    
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    [task.cancel() for task in tasks]
+    
+    logger.info(f"Cancelling {len(tasks)} outstanding tasks")
+    await asyncio.gather(*tasks, return_exceptions=True)
+    loop.stop()
 
 if __name__ == '__main__':
     loop = asyncio.new_event_loop()
@@ -355,10 +366,11 @@ if __name__ == '__main__':
     
     bot_app = BotApplication()
     
-    for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+    # Set up signal handlers
+    signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
+    for s in signals:
         loop.add_signal_handler(
-            sig,
-            lambda sig=sig: handle_signal(bot_app, sig)
+            s, lambda s=s: asyncio.create_task(shutdown(s, loop))
         )
     
     try:
