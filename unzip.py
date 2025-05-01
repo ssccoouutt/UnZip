@@ -108,44 +108,35 @@ class BotApplication:
         )
 
     async def run_webserver(self):
-        """Run the web server for health checks with retries"""
-        max_retries = 3
-        retry_delay = 2
-        
-        for attempt in range(max_retries):
-            try:
-                app = web.Application()
-                app.router.add_get(HEALTH_CHECK_ENDPOINT, self.health_check)
-                app.router.add_get("/", self.root_handler)
-                
-                self.runner = web.AppRunner(app)
-                await self.runner.setup()
-                
-                # Try to find an available port if default is taken
-                port = WEB_PORT
-                while True:
-                    try:
-                        self.site = web.TCPSite(self.runner, '0.0.0.0', port)
-                        await self.site.start()
-                        logger.info(f"Health check server running on port {port}")
-                        return True
-                    except OSError as e:
-                        if "Address already in use" in str(e) and port == WEB_PORT:
-                            port += 1
-                            logger.warning(f"Port {WEB_PORT} in use, trying {port}")
-                            continue
-                        raise
-                        
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    logger.error(f"Failed to start web server after {max_retries} attempts: {e}")
-                    return False
-                
-                logger.warning(f"Web server start attempt {attempt + 1} failed, retrying in {retry_delay}s: {e}")
-                await asyncio.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
-
-        return False
+        """Run the web server for health checks"""
+        try:
+            app = web.Application()
+            app.router.add_get(HEALTH_CHECK_ENDPOINT, self.health_check)
+            app.router.add_get("/", self.root_handler)
+            
+            self.runner = web.AppRunner(app)
+            await self.runner.setup()
+            
+            # Try to find an available port
+            port = WEB_PORT
+            max_attempts = 5
+            for attempt in range(max_attempts):
+                try:
+                    self.site = web.TCPSite(self.runner, '0.0.0.0', port)
+                    await self.site.start()
+                    logger.info(f"Health check server running on port {port}")
+                    return True
+                except OSError as e:
+                    if "Address already in use" in str(e) and attempt < max_attempts - 1:
+                        port += 1
+                        logger.warning(f"Port {port-1} in use, trying {port}")
+                        continue
+                    raise
+            
+            return False
+        except Exception as e:
+            logger.error(f"Failed to start web server: {e}")
+            return False
 
     async def self_ping(self):
         """Keep-alive mechanism"""
@@ -174,6 +165,180 @@ class BotApplication:
                     await self.shutdown()
                 break
 
+    def authorize_google_drive(self):
+        """Authorize Google Drive"""
+        try:
+            if not os.path.exists(TOKEN_FILE):
+                raise FileNotFoundError(f"Token file {TOKEN_FILE} not found")
+            
+            with open(TOKEN_FILE, 'r') as token_file:
+                token_data = json.load(token_file)
+                
+            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            return creds
+        except Exception as e:
+            logger.error(f"Failed to authorize Google Drive: {e}")
+            raise
+
+    async def download_file_from_link(self, url, destination):
+        """Download file with retries"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if "drive.google.com" in url:
+                    file_id = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+                    if not file_id:
+                        return False, "❌ Invalid Google Drive link."
+                    file_id = file_id.group(1)
+                    download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+                    creds = self.authorize_google_drive()
+                    headers = {"Authorization": f"Bearer {creds.token}"}
+                    response = requests.get(download_url, headers=headers, stream=True)
+                else:
+                    response = requests.get(url, stream=True)
+
+                response.raise_for_status()
+                
+                file_size = int(response.headers.get('content-length', 0))
+                if file_size > MAX_FILE_SIZE:
+                    return False, f"❌ File too large (max 5GB allowed)"
+
+                with open(destination, 'wb') as file:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            file.write(chunk)
+                return True, None
+                
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    return False, f"❌ Download failed: {e}"
+                await asyncio.sleep(5)
+
+    async def extract_archive(self, archive_path, extract_dir):
+        """Extract files from archive"""
+        try:
+            if not os.path.exists(archive_path):
+                return False, "❌ Archive file not found"
+
+            folder_name = os.path.splitext(os.path.basename(archive_path))[0]
+            extract_dir = os.path.join(extract_dir, folder_name)
+            os.makedirs(extract_dir, exist_ok=True)
+
+            if zipfile.is_zipfile(archive_path):
+                with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                    zip_ref.extractall(extract_dir)
+                return True, None
+            return False, "❌ Only ZIP files supported"
+        except Exception as e:
+            return False, f"❌ Extraction failed: {e}"
+
+    async def process_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Process download link"""
+        self.active_operations += 1
+        self.last_activity = time.time()
+        
+        try:
+            async with self.upload_semaphore:
+                url = update.message.text.strip()
+                
+                if "drive.google.com" in url:
+                    file_id = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+                    if not file_id:
+                        return await update.message.reply_text("❌ Invalid Google Drive link.")
+                    
+                    creds = self.authorize_google_drive()
+                    service = build('drive', 'v3', credentials=creds)
+                    file_info = service.files().get(fileId=file_id.group(1), fields='name').execute()
+                    file_name = file_info['name']
+                else:
+                    file_name = os.path.basename(urlparse(url).path.split('/')[-1] or "archive")
+                    file_name = file_name.split('?')[0]
+                    
+                file_path = os.path.join(tempfile.gettempdir(), file_name)
+                
+                await update.message.reply_text("⬇️ Downloading file...")
+                success, error = await self.download_file_from_link(url, file_path)
+                if not success:
+                    return await update.message.reply_text(error)
+
+                temp_extract_dir = tempfile.mkdtemp()
+                
+                await update.message.reply_text("📦 Extracting files...")
+                success, error = await self.extract_archive(file_path, temp_extract_dir)
+                if not success:
+                    shutil.rmtree(temp_extract_dir, ignore_errors=True)
+                    return await update.message.reply_text(error)
+
+                folder_name = os.path.splitext(os.path.basename(file_path))[0]
+                extract_dir = os.path.join(temp_extract_dir, folder_name)
+                
+                if not os.path.exists(extract_dir):
+                    shutil.rmtree(temp_extract_dir, ignore_errors=True)
+                    return await update.message.reply_text("❌ No files found in archive")
+
+                await update.message.reply_text(f"📁 Creating folder '{folder_name}'...")
+                creds = self.authorize_google_drive()
+                service = build('drive', 'v3', credentials=creds)
+                
+                folder_metadata = {
+                    'name': folder_name,
+                    'mimeType': 'application/vnd.google-apps.folder'
+                }
+                folder = service.files().create(body=folder_metadata, fields='id').execute()
+                folder_id = folder.get('id')
+                
+                uploaded_files = []
+                for root, _, files in os.walk(extract_dir):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        relative_path = os.path.relpath(root, extract_dir)
+                        current_parent = folder_id
+                        
+                        if relative_path != '.':
+                            path_parts = relative_path.split(os.sep)
+                            for part in path_parts:
+                                query = f"name='{part}' and '{current_parent}' in parents and mimeType='application/vnd.google-apps.folder'"
+                                results = service.files().list(q=query, fields="files(id)").execute()
+                                items = results.get('files', [])
+                                
+                                if items:
+                                    current_parent = items[0]['id']
+                                else:
+                                    file_metadata = {
+                                        'name': part,
+                                        'mimeType': 'application/vnd.google-apps.folder',
+                                        'parents': [current_parent]
+                                    }
+                                    new_folder = service.files().create(body=file_metadata, fields='id').execute()
+                                    current_parent = new_folder.get('id')
+                        
+                        file_metadata = {
+                            'name': file,
+                            'parents': [current_parent]
+                        }
+                        media = MediaFileUpload(file_path, resumable=True)
+                        service.files().create(
+                            body=file_metadata,
+                            media_body=media,
+                            fields='id'
+                        ).execute()
+                        uploaded_files.append(file)
+
+                message = f"✅ Uploaded {len(uploaded_files)} files to Google Drive\n📁 Folder: {folder_name}"
+                await update.message.reply_text(message)
+
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+            logger.error(f"Processing error: {e}", exc_info=True)
+        finally:
+            self.active_operations -= 1
+            if 'file_path' in locals() and os.path.exists(file_path):
+                os.remove(file_path)
+            if 'temp_extract_dir' in locals() and os.path.exists(temp_extract_dir):
+                shutil.rmtree(temp_extract_dir, ignore_errors=True)
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send welcome message"""
         self.last_activity = time.time()
@@ -194,38 +359,11 @@ class BotApplication:
             "2. I'll download, extract and upload the contents to Google Drive\n"
             "3. Files will be organized in a folder with the same name as the ZIP file\n\n"
             "⚠️ Max file size: 5GB\n"
-            "❌ Only ZIP files are supported\n\n"
-            "For large files, please be patient as uploads may take time"
+            "❌ Only ZIP files are supported"
         )
 
-    async def process_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Process download link with operation tracking"""
-        self.active_operations += 1
-        self.last_activity = time.time()
-        
-        try:
-            async with self.upload_semaphore:
-                url = update.message.text.strip()
-                
-                if not re.match(r'^https?://', url, re.IGNORECASE):
-                    return await update.message.reply_text("❌ Invalid URL format. Please provide a valid HTTP/HTTPS link.")
-
-                await asyncio.wait_for(
-                    self._process_link_internal(update, url),
-                    timeout=MAX_UPLOAD_TIME
-                )
-                
-        except asyncio.TimeoutError:
-            await update.message.reply_text("❌ Operation timed out (30 minutes max)")
-            logger.error(f"Timeout processing link: {url}")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-            logger.error(f"Error processing link: {e}", exc_info=True)
-        finally:
-            self.active_operations -= 1
-
     async def shutdown(self):
-        """Graceful shutdown with proper cleanup"""
+        """Graceful shutdown"""
         async with self._shutdown_lock:
             if self.shutting_down:
                 return
@@ -263,7 +401,7 @@ class BotApplication:
             if self.runner:
                 await self.runner.cleanup()
                 
-            # Wait for active operations to complete (with timeout)
+            # Wait for active operations to complete
             if self.active_operations > 0:
                 logger.info(f"Waiting for {self.active_operations} active operations to complete...")
                 start_wait = time.time()
@@ -273,7 +411,7 @@ class BotApplication:
             logger.info("Shutdown completed")
 
     async def run_bot(self):
-        """Run the Telegram bot with proper initialization"""
+        """Run the Telegram bot"""
         try:
             self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
             
@@ -288,8 +426,7 @@ class BotApplication:
             await self.application.updater.start_polling(
                 drop_pending_updates=True,
                 timeout=30,
-                poll_interval=1.0,
-                allowed_updates=Update.ALL_TYPES
+                poll_interval=1.0
             )
             
             logger.info("Bot started successfully")
