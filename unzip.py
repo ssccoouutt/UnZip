@@ -60,6 +60,41 @@ class BotApplication:
         self.upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
         self.health_check_lock = asyncio.Lock()
 
+    async def root_handler(self, request):
+        """Handle requests to the root endpoint"""
+        return web.Response(
+            text="Google Drive Uploader Bot\n\n"
+                 f"Uptime: {timedelta(seconds=time.time() - self.start_time)}\n"
+                 f"Last activity: {datetime.fromtimestamp(self.last_activity)}\n"
+                 f"Active operations: {self.active_operations}\n\n"
+                 f"Health check: http://{request.host}{HEALTH_CHECK_ENDPOINT}",
+            headers={"Content-Type": "text/plain"}
+        )
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send welcome message"""
+        self.last_activity = time.time()
+        await update.message.reply_text(
+            "Welcome to Google Drive Uploader Bot!\n\n"
+            "Send me a direct download link or Google Drive link to a ZIP file\n"
+            "I'll extract and upload its contents to Google Drive\n\n"
+            "⚠️ Max file size: 5GB\n"
+            "❌ Only ZIP files are supported"
+        )
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send help message"""
+        self.last_activity = time.time()
+        await update.message.reply_text(
+            "📚 How to use this bot:\n\n"
+            "1. Send me a direct download link or Google Drive link to a ZIP file\n"
+            "2. I'll download, extract and upload the contents to Google Drive\n"
+            "3. Files will be organized in a folder with the same name as the ZIP file\n\n"
+            "⚠️ Max file size: 5GB\n"
+            "❌ Only ZIP files are supported\n\n"
+            "For large files, please be patient as uploads may take time"
+        )
+
     async def init_session(self):
         """Initialize aiohttp session with increased timeouts"""
         timeout = aiohttp.ClientTimeout(
@@ -252,6 +287,36 @@ class BotApplication:
             if 'response' in locals():
                 response.close()
 
+    async def extract_archive(self, archive_path, extract_dir):
+        """Extract files from archive with validation"""
+        try:
+            if not os.path.exists(archive_path):
+                return False, "❌ Archive file not found"
+
+            # Validate file is actually a zip
+            if not zipfile.is_zipfile(archive_path):
+                return False, "❌ Only ZIP files supported"
+
+            folder_name = os.path.splitext(os.path.basename(archive_path))[0]
+            extract_dir = os.path.join(extract_dir, folder_name)
+            os.makedirs(extract_dir, exist_ok=True)
+
+            # Test zip file integrity first
+            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                bad_file = zip_ref.testzip()
+                if bad_file:
+                    return False, f"❌ Corrupted ZIP file (bad file: {bad_file})"
+
+                # Now actually extract
+                zip_ref.extractall(extract_dir)
+
+            return True, None
+            
+        except zipfile.BadZipFile:
+            return False, "❌ Corrupted or invalid ZIP file"
+        except Exception as e:
+            return False, f"❌ Extraction failed: {str(e)}"
+
     async def process_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Process download link with operation tracking"""
         self.active_operations += 1
@@ -434,6 +499,23 @@ class BotApplication:
                 except Exception as e:
                     logger.warning(f"Failed to remove temp dir: {e}")
 
+    def authorize_google_drive(self):
+        """Authorize Google Drive with token refresh"""
+        try:
+            token_data = self.load_token()
+            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+            
+            if not creds or not creds.valid:
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                else:
+                    raise ValueError("Invalid credentials")
+                    
+            return creds
+        except Exception as e:
+            logger.error(f"Google Drive authorization failed: {e}")
+            raise
+
     async def shutdown(self):
         """Graceful shutdown with proper cleanup"""
         if self.shutting_down:
@@ -521,10 +603,9 @@ class BotApplication:
             await self.shutdown()
 
 if __name__ == '__main__':
-    # Configure event loop with debug
+    # Configure event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.set_debug(True)
     
     # Create application
     bot_app = BotApplication()
