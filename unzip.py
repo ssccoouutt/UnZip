@@ -108,16 +108,44 @@ class BotApplication:
         )
 
     async def run_webserver(self):
-        """Run the web server for health checks"""
-        app = web.Application()
-        app.router.add_get(HEALTH_CHECK_ENDPOINT, self.health_check)
-        app.router.add_get("/", self.root_handler)
+        """Run the web server for health checks with retries"""
+        max_retries = 3
+        retry_delay = 2
         
-        self.runner = web.AppRunner(app)
-        await self.runner.setup()
-        self.site = web.TCPSite(self.runner, '0.0.0.0', WEB_PORT)
-        await self.site.start()
-        logger.info(f"Health check server running on port {WEB_PORT}")
+        for attempt in range(max_retries):
+            try:
+                app = web.Application()
+                app.router.add_get(HEALTH_CHECK_ENDPOINT, self.health_check)
+                app.router.add_get("/", self.root_handler)
+                
+                self.runner = web.AppRunner(app)
+                await self.runner.setup()
+                
+                # Try to find an available port if default is taken
+                port = WEB_PORT
+                while True:
+                    try:
+                        self.site = web.TCPSite(self.runner, '0.0.0.0', port)
+                        await self.site.start()
+                        logger.info(f"Health check server running on port {port}")
+                        return True
+                    except OSError as e:
+                        if "Address already in use" in str(e) and port == WEB_PORT:
+                            port += 1
+                            logger.warning(f"Port {WEB_PORT} in use, trying {port}")
+                            continue
+                        raise
+                        
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"Failed to start web server after {max_retries} attempts: {e}")
+                    return False
+                
+                logger.warning(f"Web server start attempt {attempt + 1} failed, retrying in {retry_delay}s: {e}")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+
+        return False
 
     async def self_ping(self):
         """Keep-alive mechanism"""
@@ -196,30 +224,6 @@ class BotApplication:
         finally:
             self.active_operations -= 1
 
-    async def _process_link_internal(self, update: Update, url: str):
-        """Internal link processing with proper resource cleanup"""
-        temp_dir = None
-        file_path = None
-        
-        try:
-            # [Previous implementation of _process_link_internal]
-            # ... (keep your existing implementation here)
-            pass
-            
-        finally:
-            # Cleanup resources
-            if file_path and os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except Exception as e:
-                    logger.warning(f"Failed to remove temp file: {e}")
-                    
-            if temp_dir and os.path.exists(temp_dir):
-                try:
-                    shutil.rmtree(temp_dir)
-                except Exception as e:
-                    logger.warning(f"Failed to remove temp dir: {e}")
-
     async def shutdown(self):
         """Graceful shutdown with proper cleanup"""
         async with self._shutdown_lock:
@@ -270,24 +274,29 @@ class BotApplication:
 
     async def run_bot(self):
         """Run the Telegram bot with proper initialization"""
-        self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        
-        self.application.add_handler(CommandHandler('start', self.start))
-        self.application.add_handler(CommandHandler('help', self.help_command))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_link))
-        
-        await self.application.initialize()
-        await self.application.start()
-        
-        # Start polling with clean state
-        await self.application.updater.start_polling(
-            drop_pending_updates=True,
-            timeout=30,
-            poll_interval=1.0,
-            allowed_updates=Update.ALL_TYPES
-        )
-        
-        logger.info("Bot started successfully")
+        try:
+            self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+            
+            self.application.add_handler(CommandHandler('start', self.start))
+            self.application.add_handler(CommandHandler('help', self.help_command))
+            self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_link))
+            
+            await self.application.initialize()
+            await self.application.start()
+            
+            # Start polling with clean state
+            await self.application.updater.start_polling(
+                drop_pending_updates=True,
+                timeout=30,
+                poll_interval=1.0,
+                allowed_updates=Update.ALL_TYPES
+            )
+            
+            logger.info("Bot started successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to start bot: {e}")
+            return False
 
     async def main(self):
         """Main application entry point"""
@@ -297,7 +306,8 @@ class BotApplication:
             if not await self.run_webserver():
                 raise RuntimeError("Failed to start web server")
                 
-            await self.run_bot()
+            if not await self.run_bot():
+                raise RuntimeError("Failed to start Telegram bot")
             
             # Start keepalive after everything else is running
             self.keepalive_task = asyncio.create_task(self.self_ping())
